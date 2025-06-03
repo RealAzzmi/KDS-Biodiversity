@@ -646,290 +646,346 @@ class FixedSpeciesDistributionModeler:
         
         # More robust JavaScript implementation
         js_code = f"""
-        var speciesData = {json.dumps(processed_species_data, ensure_ascii=False, indent=2)};
-        var speciesList = {json.dumps(species_list, ensure_ascii=False)};
-        var currentLayers = [];
-        var mapVarName = '{map_var_name}';
-        var map = window[mapVarName];
-        
-        console.log('Map variable name:', mapVarName);
-        console.log('Map object:', map);
-        console.log('Species data loaded:', Object.keys(speciesData).length, 'species');
-        
-        function findMap() {{
-            // Try multiple ways to find the map object
-            if (window[mapVarName]) {{
-                return window[mapVarName];
-            }}
-            
-            // Try to find any Leaflet map in window
-            for (var key in window) {{
-                if (window[key] && window[key]._container && window[key].addLayer) {{
-                    console.log('Found map via fallback:', key);
-                    return window[key];
-                }}
-            }}
-            
-            // Try to find via Leaflet's global maps
-            if (window.L && window.L.Map) {{
-                var maps = document.querySelectorAll('.folium-map');
-                if (maps.length > 0) {{
-                    var mapDiv = maps[0];
-                    for (var key in window) {{
-                        if (window[key] && window[key]._container === mapDiv) {{
-                            console.log('Found map via container match:', key);
-                            return window[key];
-                        }}
-                    }}
-                }}
-            }}
-            
-            console.error('Could not find map object');
-            return null;
+    var speciesData = {json.dumps(processed_species_data, ensure_ascii=False, indent=2)};
+    var speciesList = {json.dumps(species_list, ensure_ascii=False)};
+    var currentLayers = [];
+    var mapVarName = '{map_var_name}';
+    var map = window[mapVarName];
+
+    console.log('Map variable name:', mapVarName);
+    console.log('Map object:', map);
+    console.log('Species data loaded:', Object.keys(speciesData).length, 'species');
+
+    function findMap() {{
+        // Try multiple ways to find the map object
+        if (window[mapVarName]) {{
+            return window[mapVarName];
         }}
         
-        function clearAllLayers() {{
-            try {{
-                var currentMap = findMap();
-                if (!currentMap) {{
-                    console.error('Cannot clear layers: map not found');
-                    return;
-                }}
-                
-                currentLayers.forEach(function(layer) {{
-                    try {{
-                        if (currentMap.hasLayer && currentMap.hasLayer(layer)) {{
-                            currentMap.removeLayer(layer);
-                        }}
-                    }} catch (e) {{
-                        console.error('Error removing layer:', e);
-                    }}
-                }});
-                currentLayers = [];
-                console.log('Cleared all layers');
-            }} catch (e) {{
-                console.error('Error clearing layers:', e);
+        // Try to find any Leaflet map in window
+        for (var key in window) {{
+            if (window[key] && window[key]._container && window[key].addLayer) {{
+                console.log('Found map via fallback:', key);
+                return window[key];
             }}
         }}
         
-        function addMarkersForSpecies(speciesName) {{
-            console.log('Adding markers for:', speciesName);
-            
+        // Try to find via Leaflet's global maps
+        if (window.L && window.L.Map) {{
+            var maps = document.querySelectorAll('.folium-map');
+            if (maps.length > 0) {{
+                var mapDiv = maps[0];
+                for (var key in window) {{
+                    if (window[key] && window[key]._container === mapDiv) {{
+                        console.log('Found map via container match:', key);
+                        return window[key];
+                    }}
+                }}
+            }}
+        }}
+        
+        console.error('Could not find map object');
+        return null;
+    }}
+
+    function clearAllLayers() {{
+        try {{
             var currentMap = findMap();
             if (!currentMap) {{
-                console.error('Cannot add markers: map not found');
+                console.error('Cannot clear layers: map not found');
                 return;
             }}
             
-            if (!speciesData[speciesName]) {{
-                console.error('No data found for species:', speciesName);
-                return;
-            }}
-            
-            var data = speciesData[speciesName];
-            console.log('Species data:', data);
-            
-            try {{
-                // High suitability markers (red)
-                if (data.high_points && data.high_points.length > 0) {{
-                    console.log('Adding', data.high_points.length, 'high suitability points');
-                    data.high_points.forEach(function(point) {{
-                        try {{
-                            var marker = L.circleMarker([point[0], point[1]], {{
-                                radius: 8,
-                                color: 'darkred',
-                                weight: 1,
-                                fillColor: 'red',
-                                fillOpacity: 0.8
-                            }}).bindTooltip('High suitability: ' + point[2].toFixed(3));
-                            
-                            marker.addTo(currentMap);
-                            currentLayers.push(marker);
-                        }} catch (e) {{
-                            console.error('Error adding high point:', e, point);
-                        }}
-                    }});
+            currentLayers.forEach(function(layer) {{
+                try {{
+                    if (currentMap.hasLayer && currentMap.hasLayer(layer)) {{
+                        currentMap.removeLayer(layer);
+                    }}
+                }} catch (e) {{
+                    console.error('Error removing layer:', e);
                 }}
-                
-                // Medium suitability markers (orange)
-                if (data.med_points && data.med_points.length > 0) {{
-                    console.log('Adding', data.med_points.length, 'medium suitability points');
-                    data.med_points.forEach(function(point) {{
-                        try {{
-                            var marker = L.circleMarker([point[0], point[1]], {{
-                                radius: 6,
-                                color: 'darkorange',
-                                weight: 1,
-                                fillColor: 'orange',
-                                fillOpacity: 0.7
-                            }}).bindTooltip('Medium suitability: ' + point[2].toFixed(3));
-                            
-                            marker.addTo(currentMap);
-                            currentLayers.push(marker);
-                        }} catch (e) {{
-                            console.error('Error adding medium point:', e, point);
-                        }}
-                    }});
-                }}
-                
-                // Low suitability markers (yellow)
-                if (data.low_points && data.low_points.length > 0) {{
-                    console.log('Adding', data.low_points.length, 'low suitability points');
-                    data.low_points.forEach(function(point) {{
-                        try {{
-                            var marker = L.circleMarker([point[0], point[1]], {{
-                                radius: 4,
-                                color: 'goldenrod',
-                                weight: 1,
-                                fillColor: 'yellow',
-                                fillOpacity: 0.6
-                            }}).bindTooltip('Low suitability: ' + point[2].toFixed(3));
-                            
-                            marker.addTo(currentMap);
-                            currentLayers.push(marker);
-                        }} catch (e) {{
-                            console.error('Error adding low point:', e, point);
-                        }}
-                    }});
-                }}
-                
-                // Presence points (green)
-                if (data.presence_points && data.presence_points.length > 0) {{
-                    console.log('Adding', data.presence_points.length, 'presence points');
-                    data.presence_points.forEach(function(point) {{
-                        try {{
-                            var marker = L.circleMarker([point[0], point[1]], {{
-                                radius: 6,
-                                color: 'darkgreen',
-                                weight: 2,
-                                fillColor: 'lightgreen',
-                                fillOpacity: 0.9
-                            }}).bindTooltip('Observed: ' + speciesName);
-                            
-                            marker.addTo(currentMap);
-                            currentLayers.push(marker);
-                        }} catch (e) {{
-                            console.error('Error adding presence point:', e, point);
-                        }}
-                    }});
-                }}
-                
-                console.log('Total layers added:', currentLayers.length);
-                updateInfoPanel(speciesName, data);
-                
-            }} catch (e) {{
-                console.error('Error adding markers:', e);
-            }}
+            }});
+            currentLayers = [];
+            console.log('Cleared all layers');
+        }} catch (e) {{
+            console.error('Error clearing layers:', e);
+        }}
+    }}
+
+    function addMarkersForSpecies(speciesName) {{
+        console.log('Adding markers for:', speciesName);
+        
+        var currentMap = findMap();
+        if (!currentMap) {{
+            console.error('Cannot add markers: map not found');
+            return;
         }}
         
-        function updateInfoPanel(speciesName, data) {{
+        if (!speciesData[speciesName]) {{
+            console.error('No data found for species:', speciesName);
+            return;
+        }}
+        
+        var data = speciesData[speciesName];
+        console.log('Species data:', data);
+        
+        try {{
+            // High suitability markers (red)
+            if (data.high_points && data.high_points.length > 0) {{
+                console.log('Adding', data.high_points.length, 'high suitability points');
+                data.high_points.forEach(function(point) {{
+                    try {{
+                        var marker = L.circleMarker([point[0], point[1]], {{
+                            radius: 8,
+                            color: 'darkred',
+                            weight: 1,
+                            fillColor: 'red',
+                            fillOpacity: 0.8
+                        }}).bindTooltip('High suitability: ' + point[2].toFixed(3));
+                        
+                        marker.addTo(currentMap);
+                        currentLayers.push(marker);
+                    }} catch (e) {{
+                        console.error('Error adding high point:', e, point);
+                    }}
+                }});
+            }}
+            
+            // Medium suitability markers (orange)
+            if (data.med_points && data.med_points.length > 0) {{
+                console.log('Adding', data.med_points.length, 'medium suitability points');
+                data.med_points.forEach(function(point) {{
+                    try {{
+                        var marker = L.circleMarker([point[0], point[1]], {{
+                            radius: 6,
+                            color: 'darkorange',
+                            weight: 1,
+                            fillColor: 'orange',
+                            fillOpacity: 0.7
+                        }}).bindTooltip('Medium suitability: ' + point[2].toFixed(3));
+                        
+                        marker.addTo(currentMap);
+                        currentLayers.push(marker);
+                    }} catch (e) {{
+                        console.error('Error adding medium point:', e, point);
+                    }}
+                }});
+            }}
+            
+            // Low suitability markers (yellow)
+            if (data.low_points && data.low_points.length > 0) {{
+                console.log('Adding', data.low_points.length, 'low suitability points');
+                data.low_points.forEach(function(point) {{
+                    try {{
+                        var marker = L.circleMarker([point[0], point[1]], {{
+                            radius: 4,
+                            color: 'goldenrod',
+                            weight: 1,
+                            fillColor: 'yellow',
+                            fillOpacity: 0.6
+                        }}).bindTooltip('Low suitability: ' + point[2].toFixed(3));
+                        
+                        marker.addTo(currentMap);
+                        currentLayers.push(marker);
+                    }} catch (e) {{
+                        console.error('Error adding low point:', e, point);
+                    }}
+                }});
+            }}
+            
+            // Presence points (green)
+            if (data.presence_points && data.presence_points.length > 0) {{
+                console.log('Adding', data.presence_points.length, 'presence points');
+                data.presence_points.forEach(function(point) {{
+                    try {{
+                        var marker = L.circleMarker([point[0], point[1]], {{
+                            radius: 6,
+                            color: 'darkgreen',
+                            weight: 2,
+                            fillColor: 'lightgreen',
+                            fillOpacity: 0.9
+                        }}).bindTooltip('Observed: ' + speciesName);
+                        
+                        marker.addTo(currentMap);
+                        currentLayers.push(marker);
+                    }} catch (e) {{
+                        console.error('Error adding presence point:', e, point);
+                    }}
+                }});
+            }}
+            
+            console.log('Total layers added:', currentLayers.length);
+            updateInfoPanel(speciesName, data);
+            
+        }} catch (e) {{
+            console.error('Error adding markers:', e);
+        }}
+    }}
+
+    function updateInfoPanel(speciesName, data) {{
+        var infoDiv = document.getElementById('speciesInfo');
+        if (infoDiv && data) {{
+            var truncatedName = speciesName.length > 35 ? speciesName.substring(0, 35) + '...' : speciesName;
+            infoDiv.innerHTML = `
+                <h4 style="margin: 0 0 10px 0; color: #2E8B57; font-size: 13px;">${{truncatedName}}</h4>
+                <div style="margin-bottom: 8px; font-size: 11px;">
+                    <b>Model Performance:</b><br>
+                    Accuracy: ${{data.model_performance.test_accuracy}}<br>
+                    AUC Score: ${{data.model_performance.auc_score}}<br>
+                    Training Points: ${{data.model_performance.n_training_points}}<br>
+                    Presences: ${{data.model_performance.n_presences}}
+                </div>
+                <div style="margin-bottom: 8px; font-size: 10px; color: #666;">
+                    <b>Habitat Suitability:</b><br>
+                    High (>0.7): ${{data.high_points.length}} points<br>
+                    Medium (0.4-0.7): ${{data.med_points.length}} points<br>
+                    Low (0.1-0.4): ${{data.low_points.length}} points<br>
+                    Observations: ${{data.presence_points.length}} points
+                </div>
+                <details style="margin-top: 8px;">
+                    <summary style="cursor: pointer; font-weight: bold; font-size: 11px;">Environmental Factors</summary>
+                    <div style="font-size: 9px; margin-top: 5px; max-height: 120px; overflow-y: auto;">
+                        ${{data.top_features}}
+                    </div>
+                </details>
+            `;
+        }}
+    }}
+
+    function calculateOverallFeatureImportance() {{
+        var aggregatedFeatures = {{}};
+        var speciesCount = 0;
+        
+        Object.keys(speciesData).forEach(function(speciesName) {{
+            speciesCount++;
+            var features = speciesData[speciesName].top_features.split('<br>');
+            features.forEach(function(feature) {{
+                if (feature.trim()) {{
+                    var parts = feature.split(':');
+                    if (parts.length === 2) {{
+                        var featureName = parts[0].trim();
+                        var importance = parseFloat(parts[1].trim());
+                        
+                        if (!aggregatedFeatures[featureName]) {{
+                            aggregatedFeatures[featureName] = {{sum: 0, count: 0, avg: 0}};
+                        }}
+                        aggregatedFeatures[featureName].sum += importance;
+                        aggregatedFeatures[featureName].count++;
+                    }}
+                }}
+            }});
+        }});
+        
+        // Calculate averages and sort
+        var sortedFeatures = Object.keys(aggregatedFeatures).map(function(feature) {{
+            var avg = aggregatedFeatures[feature].sum / aggregatedFeatures[feature].count;
+            return {{
+                feature: feature,
+                avgImportance: avg,
+                speciesCount: aggregatedFeatures[feature].count,
+                totalSpecies: speciesCount
+            }};
+        }}).sort(function(a, b) {{
+            return b.avgImportance - a.avgImportance;
+        }});
+        
+        return sortedFeatures;
+    }}
+
+    function showFeatureImportanceSummary() {{
+        var summaryFeatures = calculateOverallFeatureImportance();
+        
+        var summaryHtml = `
+            <div style="padding: 20px; max-height: 500px; overflow-y: auto;">
+                <h3 style="color: #2E8B57; margin-bottom: 15px;">Overall Feature Importance Summary</h3>
+                <p style="font-size: 12px; color: #666; margin-bottom: 15px;">
+                    Aggregated across all ${{Object.keys(speciesData).length}} species models
+                </p>
+                <table style="width: 100%; border-collapse: collapse; font-size: 11px;">
+                    <thead>
+                        <tr style="background-color: #f0f8ff; font-weight: bold;">
+                            <th style="border: 1px solid #ccc; padding: 8px; text-align: left;">Rank</th>
+                            <th style="border: 1px solid #ccc; padding: 8px; text-align: left;">Environmental Variable</th>
+                            <th style="border: 1px solid #ccc; padding: 8px; text-align: right;">Avg Importance</th>
+                            <th style="border: 1px solid #ccc; padding: 8px; text-align: right;">Used in Models</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+        `;
+        
+        summaryFeatures.forEach(function(item, index) {{
+            var percentage = (item.speciesCount / item.totalSpecies * 100).toFixed(1);
+            var rowColor = index % 2 === 0 ? '#f9f9f9' : 'white';
+            var importanceColor = item.avgImportance > 0.1 ? '#2E8B57' : '#666';
+            
+            summaryHtml += `
+                <tr style="background-color: ${{rowColor}};">
+                    <td style="border: 1px solid #ccc; padding: 6px; text-align: center; font-weight: bold;">${{index + 1}}</td>
+                    <td style="border: 1px solid #ccc; padding: 6px; font-weight: bold;">${{item.feature}}</td>
+                    <td style="border: 1px solid #ccc; padding: 6px; text-align: right; color: ${{importanceColor}}; font-weight: bold;">${{item.avgImportance.toFixed(4)}}</td>
+                    <td style="border: 1px solid #ccc; padding: 6px; text-align: right;">${{item.speciesCount}}/${{item.totalSpecies}} (${{percentage}}%)</td>
+                </tr>
+            `;
+        }});
+        
+        summaryHtml += `
+                    </tbody>
+                </table>
+                <div style="margin-top: 15px; padding: 10px; background-color: #f5f5dc; border-radius: 5px; font-size: 10px;">
+                    <strong>Variable Descriptions:</strong><br>
+                    • <strong>bio1-19:</strong> WorldClim bioclimatic variables (temperature, precipitation patterns)<br>
+                    • <strong>elevation:</strong> Altitude above sea level (meters)<br>
+                    • <strong>slope, aspect:</strong> Terrain slope and orientation characteristics<br>
+                    • <strong>distance_to_coast:</strong> Distance to nearest coastline (km)<br>
+                    • <strong>population_density:</strong> Human population density (people/km²)
+                </div>
+                <div style="margin-top: 10px; padding: 10px; background-color: #e6f3ff; border-radius: 5px; font-size: 10px;">
+                    <strong>Interpretation:</strong><br>
+                    • Higher importance values indicate stronger influence on species distribution<br>
+                    • Variables used in more models are generally more reliable predictors<br>
+                    • Top-ranked variables represent key environmental drivers across Indonesian fauna
+                </div>
+            </div>
+        `;
+        
+        // Create or update the feature summary panel
+        var summaryDiv = document.getElementById('featureSummaryPanel');
+        if (!summaryDiv) {{
+            summaryDiv = document.createElement('div');
+            summaryDiv.id = 'featureSummaryPanel';
+            summaryDiv.style.cssText = `
+                position: fixed; top: 5%; left: 5%; width: 90%; height: 90%;
+                background-color: white; border: 2px solid #2E8B57; z-index: 10000;
+                border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+                display: none;
+            `;
+            document.body.appendChild(summaryDiv);
+        }}
+        
+        // Add close button and content
+        summaryDiv.innerHTML = `
+            <div style="position: relative; height: 100%;">
+                <button onclick="document.getElementById('featureSummaryPanel').style.display='none';" 
+                        style="position: absolute; top: 15px; right: 20px; background: #dc3545; color: white; 
+                            border: none; border-radius: 50%; width: 35px; height: 35px; cursor: pointer; 
+                            font-weight: bold; z-index: 10001; font-size: 18px;">×</button>
+                ${{summaryHtml}}
+            </div>
+        `;
+        
+        summaryDiv.style.display = 'block';
+    }}
+
+    function changeSpecies(speciesName) {{
+        console.log('Changing to species:', speciesName);
+        clearAllLayers();
+        
+        if (speciesName && speciesName !== '') {{
+            addMarkersForSpecies(speciesName);
+        }} else {{
+            // Clear info panel
             var infoDiv = document.getElementById('speciesInfo');
-            if (infoDiv && data) {{
-                var truncatedName = speciesName.length > 35 ? speciesName.substring(0, 35) + '...' : speciesName;
-                infoDiv.innerHTML = `
-                    <h4 style="margin: 0 0 10px 0; color: #2E8B57; font-size: 13px;">${{truncatedName}}</h4>
-                    <div style="margin-bottom: 8px; font-size: 11px;">
-                        <b>Model Performance:</b><br>
-                        Accuracy: ${{data.model_performance.test_accuracy}}<br>
-                        AUC Score: ${{data.model_performance.auc_score}}<br>
-                        Training Points: ${{data.model_performance.n_training_points}}<br>
-                        Presences: ${{data.model_performance.n_presences}}
-                    </div>
-                    <div style="margin-bottom: 8px; font-size: 10px; color: #666;">
-                        <b>Habitat Suitability:</b><br>
-                        High (>0.7): ${{data.high_points.length}} points<br>
-                        Medium (0.4-0.7): ${{data.med_points.length}} points<br>
-                        Low (0.1-0.4): ${{data.low_points.length}} points<br>
-                        Observations: ${{data.presence_points.length}} points
-                    </div>
-                    <details style="margin-top: 8px;">
-                        <summary style="cursor: pointer; font-weight: bold; font-size: 11px;">Environmental Factors</summary>
-                        <div style="font-size: 9px; margin-top: 5px; max-height: 120px; overflow-y: auto;">
-                            ${{data.top_features}}
-                        </div>
-                    </details>
-                `;
-            }}
-        }}
-        
-        function changeSpecies(speciesName) {{
-            console.log('Changing to species:', speciesName);
-            clearAllLayers();
-            
-            if (speciesName && speciesName !== '') {{
-                addMarkersForSpecies(speciesName);
-            }} else {{
-                // Clear info panel
-                var infoDiv = document.getElementById('speciesInfo');
-                if (infoDiv) {{
-                    infoDiv.innerHTML = `
-                        <p style="color: #666; font-size: 10px; margin: 0;">
-                            Select a species to view its predicted distribution.
-                            <br><br>
-                            🔴 Red = High habitat suitability (>0.7)<br>
-                            🟠 Orange = Medium suitability (0.4-0.7)<br>
-                            🟡 Yellow = Low suitability (0.1-0.4)<br>
-                            🟢 Green = Observed occurrences<br><br>
-                            Click markers for suitability values
-                        </p>
-                    `;
-                }}
-            }}
-        }}
-        
-        // Initialize interface after DOM is ready
-        setTimeout(function() {{
-            try {{
-                console.log('Initializing interface...');
-                
-                // Test map access
-                var testMap = findMap();
-                if (testMap) {{
-                    console.log('✅ Map found successfully:', testMap);
-                    console.log('Map has addLayer method:', typeof testMap.addLayer === 'function');
-                }} else {{
-                    console.error('❌ Map not found during initialization');
-                    // Try to show available window objects for debugging
-                    console.log('Available window objects:', Object.keys(window).filter(k => k.includes('map')));
-                }}
-                
-                // Create species selector
-                var controlDiv = document.createElement('div');
-                controlDiv.style.cssText = `
-                    position: fixed; top: 10px; left: 50px; z-index: 9999;
-                    background-color: white; padding: 8px; border-radius: 5px;
-                    box-shadow: 0 2px 4px rgba(0,0,0,0.2);
-                `;
-                
-                var select = document.createElement('select');
-                select.style.cssText = 'width: 280px; font-size: 11px; padding: 4px;';
-                select.innerHTML = '<option value="">🔍 Select a species to view distribution...</option>';
-                
-                speciesList.forEach(function(species) {{
-                    var option = document.createElement('option');
-                    option.value = species;
-                    option.textContent = species;
-                    select.appendChild(option);
-                }});
-                
-                select.addEventListener('change', function() {{
-                    console.log('Species selection changed to:', this.value);
-                    changeSpecies(this.value);
-                }});
-                
-                controlDiv.appendChild(select);
-                document.body.appendChild(controlDiv);
-                
-                // Create info panel
-                var infoDiv = document.createElement('div');
-                infoDiv.id = 'speciesInfo';
-                infoDiv.style.cssText = `
-                    position: fixed; top: 10px; right: 10px; width: 260px;
-                    background-color: white; border: 1px solid #ccc; z-index: 9999;
-                    font-size: 11px; padding: 10px; border-radius: 5px;
-                    box-shadow: 0 2px 4px rgba(0,0,0,0.2); max-height: 400px;
-                    overflow-y: auto;
-                `;
+            if (infoDiv) {{
                 infoDiv.innerHTML = `
                     <p style="color: #666; font-size: 10px; margin: 0;">
                         Select a species to view its predicted distribution.
@@ -941,16 +997,106 @@ class FixedSpeciesDistributionModeler:
                         Click markers for suitability values
                     </p>
                 `;
-                document.body.appendChild(infoDiv);
-                
-                console.log('Interface initialized successfully');
-                
-            }} catch (e) {{
-                console.error('Error initializing interface:', e);
             }}
-        }}, 2000);  // Increased timeout to ensure map is fully loaded
+        }}
+    }}
+
+    // Initialize interface after DOM is ready
+    setTimeout(function() {{
+        try {{
+            console.log('Initializing interface...');
+            
+            // Test map access
+            var testMap = findMap();
+            if (testMap) {{
+                console.log('✅ Map found successfully:', testMap);
+                console.log('Map has addLayer method:', typeof testMap.addLayer === 'function');
+            }} else {{
+                console.error('❌ Map not found during initialization');
+                // Try to show available window objects for debugging
+                console.log('Available window objects:', Object.keys(window).filter(k => k.includes('map')));
+            }}
+            
+            // Create control panel container
+            var controlDiv = document.createElement('div');
+            controlDiv.style.cssText = `
+                position: fixed; top: 10px; left: 50px; z-index: 9999;
+                background-color: white; padding: 8px; border-radius: 5px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.2); display: flex; align-items: center; gap: 10px;
+            `;
+            
+            // Create species selector
+            var select = document.createElement('select');
+            select.style.cssText = 'width: 280px; font-size: 11px; padding: 4px;';
+            select.innerHTML = '<option value="">🔍 Select a species to view distribution...</option>';
+            
+            speciesList.forEach(function(species) {{
+                var option = document.createElement('option');
+                option.value = species;
+                option.textContent = species;
+                select.appendChild(option);
+            }});
+            
+            select.addEventListener('change', function() {{
+                console.log('Species selection changed to:', this.value);
+                changeSpecies(this.value);
+            }});
+            
+            // Create feature importance summary button
+            var summaryButton = document.createElement('button');
+            summaryButton.textContent = '📊 Feature Summary';
+            summaryButton.style.cssText = `
+                padding: 6px 12px; font-size: 11px; 
+                background-color: #2E8B57; color: white; border: none; 
+                border-radius: 4px; cursor: pointer; white-space: nowrap;
+            `;
+            summaryButton.addEventListener('click', showFeatureImportanceSummary);
+            
+            // Add hover effects
+            summaryButton.addEventListener('mouseenter', function() {{
+                this.style.backgroundColor = '#1e5c42';
+            }});
+            summaryButton.addEventListener('mouseleave', function() {{
+                this.style.backgroundColor = '#2E8B57';
+            }});
+            
+            controlDiv.appendChild(select);
+            controlDiv.appendChild(summaryButton);
+            document.body.appendChild(controlDiv);
+            
+            // Create info panel
+            var infoDiv = document.createElement('div');
+            infoDiv.id = 'speciesInfo';
+            infoDiv.style.cssText = `
+                position: fixed; top: 10px; right: 10px; width: 260px;
+                background-color: white; border: 1px solid #ccc; z-index: 9999;
+                font-size: 11px; padding: 10px; border-radius: 5px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.2); max-height: 400px;
+                overflow-y: auto;
+            `;
+            infoDiv.innerHTML = `
+                <p style="color: #666; font-size: 10px; margin: 0;">
+                    Select a species to view its predicted distribution.
+                    <br><br>
+                    🔴 Red = High habitat suitability (>0.7)<br>
+                    🟠 Orange = Medium suitability (0.4-0.7)<br>
+                    🟡 Yellow = Low suitability (0.1-0.4)<br>
+                    🟢 Green = Observed occurrences<br><br>
+                    Click markers for suitability values<br><br>
+                    📊 Click "Feature Summary" for overall environmental analysis
+                </p>
+            `;
+            document.body.appendChild(infoDiv);
+            
+            console.log('Interface initialized successfully');
+            console.log('Total species available:', speciesList.length);
+            
+        }} catch (e) {{
+            console.error('Error initializing interface:', e);
+        }}
+    }}, 2000);  // Increased timeout to ensure map is fully loaded
         """
-        
+
         # Add JavaScript to map
         m.get_root().html.add_child(folium.Element(f"<script>{js_code}</script>"))
         
@@ -1162,7 +1308,7 @@ def main():
     modeler = FixedSpeciesDistributionModeler()
     
     # Configuration
-    max_species = 8  # Reduced for testing
+    max_species = 100  # Reduced for testing
     min_occurrences = 30  # Increased for better models
     
     print(f"⚙️  Configuration:")
