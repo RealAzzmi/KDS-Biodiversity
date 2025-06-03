@@ -528,11 +528,11 @@ class FixedSpeciesDistributionModeler:
         m = folium.Map(
             location=[-2.5, 118.0],
             zoom_start=5,
-            tiles='OpenStreetMap'
+            tiles='CartoDB positron'  # Light background tile
         )
         
         # Add tile layers
-        folium.TileLayer('CartoDB positron', name='Light').add_to(m)
+        folium.TileLayer('OpenStreetMap', name='OpenStreetMap').add_to(m)
         folium.TileLayer('CartoDB dark_matter', name='Dark').add_to(m)
         
         # Process species data more robustly
