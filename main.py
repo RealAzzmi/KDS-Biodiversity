@@ -51,15 +51,6 @@ class ComprehensiveBiodiversityAnalyzer:
             'last_download_key': None
         }
         
-        # Fallback crawl metadata for API crawling
-        self.crawl_metadata = {
-            'total_records': 0,
-            'last_offset': 0,
-            'start_time': None,
-            'end_time': None,
-            'crawl_sessions': []
-        }
-        
         # Load existing metadata if available
         self.load_download_metadata()
         
@@ -131,24 +122,12 @@ class ComprehensiveBiodiversityAnalyzer:
         if metadata_file.exists():
             with open(metadata_file, 'r') as f:
                 self.download_metadata = json.load(f)
-        
-        # Also load crawl metadata for fallback
-        crawl_metadata_file = self.data_dir / "crawl_metadata.json"
-        if crawl_metadata_file.exists():
-            with open(crawl_metadata_file, 'r') as f:
-                self.crawl_metadata = json.load(f)
                 
     def save_download_metadata(self):
         """Save download metadata"""
         metadata_file = self.data_dir / "download_metadata.json"
         with open(metadata_file, 'w') as f:
             json.dump(self.download_metadata, f, indent=2, default=str)
-    
-    def save_crawl_metadata(self):
-        """Save crawl metadata"""
-        metadata_file = self.data_dir / "crawl_metadata.json"
-        with open(metadata_file, 'w') as f:
-            json.dump(self.crawl_metadata, f, indent=2, default=str)
             
     def request_gbif_bulk_download(self):
         """
@@ -163,7 +142,6 @@ class ComprehensiveBiodiversityAnalyzer:
             print("     gbif_username='your_username',")
             print("     gbif_password='your_password',")
             print("     gbif_email='your@email.com')")
-            print("\n⚠️  Falling back to API crawling method...")
             return None
             
         print("🚀 Requesting GBIF bulk download for Indonesian animals...")
@@ -379,8 +357,43 @@ class ComprehensiveBiodiversityAnalyzer:
         print(f"📥 Importing data from {data_file} into database...")
         
         try:
-            # Read the CSV file in chunks to handle large files
-            chunk_size = 10000
+            # First, let's examine the CSV structure
+            print("🔍 Examining CSV structure...")
+            sample_df = pd.read_csv(data_file, sep='\t', nrows=5)
+            print(f"CSV columns: {list(sample_df.columns)}")
+            
+            # Map GBIF CSV columns to our database schema
+            column_mapping = {
+                'gbifID': 'gbifID',
+                'species': 'species', 
+                'scientificName': 'scientificName',
+                'kingdom': 'kingdom',
+                'phylum': 'phylum',
+                'class': 'class',
+                'order': 'order_name',  # order is reserved word
+                'family': 'family',
+                'genus': 'genus',
+                'decimalLatitude': 'decimalLatitude',
+                'decimalLongitude': 'decimalLongitude',
+                'countryCode': 'country',  # Use countryCode as country
+                'stateProvince': 'stateProvince', 
+                'locality': 'locality',
+                'year': 'year',
+                'month': 'month',
+                'day': 'day',
+                'basisOfRecord': 'basisOfRecord',
+                'institutionCode': 'institutionCode',
+                'collectionCode': 'collectionCode',
+                'catalogNumber': 'catalogNumber',
+                'recordedBy': 'recordedBy',
+                'eventDate': 'eventDate',
+                'coordinateUncertaintyInMeters': 'coordinateUncertaintyInMeters',
+                'elevation': 'elevation',
+                'depth': 'depth'
+            }
+            
+            # Read the CSV file in smaller chunks to avoid SQL variable limit
+            chunk_size = 1000  # Reduced from 10000 to avoid SQL variable limit
             total_imported = 0
             
             # Get file size for progress tracking
@@ -389,23 +402,61 @@ class ComprehensiveBiodiversityAnalyzer:
             
             conn = sqlite3.connect(self.db_path)
             
+            # Read CSV and process in chunks
             for chunk_num, chunk in enumerate(pd.read_csv(data_file, sep='\t', chunksize=chunk_size, low_memory=False)):
+                # Select only columns that exist in both CSV and our mapping
+                available_columns = [col for col in column_mapping.keys() if col in chunk.columns]
+                chunk_selected = chunk[available_columns].copy()
+                
+                # Rename columns to match database schema
+                chunk_selected = chunk_selected.rename(columns={col: column_mapping[col] for col in available_columns})
+                
                 # Clean and prepare data
-                chunk = chunk.dropna(subset=['species', 'decimalLatitude', 'decimalLongitude'])
+                chunk_selected = chunk_selected.dropna(subset=['decimalLatitude', 'decimalLongitude'])
+                
+                # Ensure we have species information
+                if 'species' in chunk_selected.columns:
+                    chunk_selected = chunk_selected.dropna(subset=['species'])
+                elif 'scientificName' in chunk_selected.columns:
+                    # Use scientificName as species if species column is missing
+                    chunk_selected['species'] = chunk_selected['scientificName']
+                    chunk_selected = chunk_selected.dropna(subset=['species'])
                 
                 # Filter by Indonesia bounds
-                chunk = chunk[
-                    (chunk['decimalLatitude'].between(self.indonesia_bounds['min_lat'], self.indonesia_bounds['max_lat'])) &
-                    (chunk['decimalLongitude'].between(self.indonesia_bounds['min_lng'], self.indonesia_bounds['max_lng']))
+                chunk_selected = chunk_selected[
+                    (chunk_selected['decimalLatitude'].between(self.indonesia_bounds['min_lat'], self.indonesia_bounds['max_lat'])) &
+                    (chunk_selected['decimalLongitude'].between(self.indonesia_bounds['min_lng'], self.indonesia_bounds['max_lng']))
                 ]
                 
-                if len(chunk) > 0:
+                if len(chunk_selected) > 0:
                     # Add download session info
-                    chunk['crawl_session'] = f"bulk_download_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    chunk_selected['crawl_session'] = f"bulk_download_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                     
-                    # Import to database
-                    chunk.to_sql('occurrences', conn, if_exists='append', index=False, method='multi')
-                    total_imported += len(chunk)
+                    # Convert data types and handle missing values
+                    for col in ['year', 'month', 'day']:
+                        if col in chunk_selected.columns:
+                            chunk_selected[col] = pd.to_numeric(chunk_selected[col], errors='coerce')
+                    
+                    for col in ['decimalLatitude', 'decimalLongitude', 'coordinateUncertaintyInMeters', 'elevation', 'depth']:
+                        if col in chunk_selected.columns:
+                            chunk_selected[col] = pd.to_numeric(chunk_selected[col], errors='coerce')
+                    
+                    # Only keep columns that exist in our database schema
+                    db_columns = [
+                        'gbifID', 'species', 'scientificName', 'kingdom', 'phylum', 'class', 'order_name',
+                        'family', 'genus', 'decimalLatitude', 'decimalLongitude', 'country', 'stateProvince',
+                        'locality', 'year', 'month', 'day', 'basisOfRecord', 'institutionCode', 'collectionCode',
+                        'catalogNumber', 'recordedBy', 'eventDate', 'coordinateUncertaintyInMeters',
+                        'elevation', 'depth', 'crawl_session'
+                    ]
+                    
+                    # Only keep columns that exist in both the chunk and our database schema
+                    final_columns = [col for col in db_columns if col in chunk_selected.columns]
+                    chunk_final = chunk_selected[final_columns]
+                    
+                    # Use manual insert to avoid SQLite variable limit
+                    self.insert_chunk_manually(conn, chunk_final)
+                    total_imported += len(chunk_final)
                 
                 # Progress update
                 processed_bytes += chunk_size * 1000  # Rough estimate
@@ -423,7 +474,36 @@ class ComprehensiveBiodiversityAnalyzer:
             
         except Exception as e:
             print(f"❌ Error importing data: {e}")
+            import traceback
+            traceback.print_exc()
             return 0
+    
+    def insert_chunk_manually(self, conn, chunk_df):
+        """
+        Manually insert chunk to avoid SQLite variable limit
+        """
+        cursor = conn.cursor()
+        
+        # Prepare the insert statement with only the columns we have
+        columns = list(chunk_df.columns)
+        placeholders = ', '.join(['?' for _ in columns])
+        column_names = ', '.join(columns)
+        
+        insert_sql = f"INSERT OR IGNORE INTO occurrences ({column_names}) VALUES ({placeholders})"
+        
+        # Convert DataFrame to list of tuples
+        records = []
+        for _, row in chunk_df.iterrows():
+            record = tuple(row[col] if pd.notna(row[col]) else None for col in columns)
+            records.append(record)
+        
+        # Insert in smaller batches to avoid variable limit
+        batch_size = 100  # Small batches to stay well under SQLite's limit
+        for i in range(0, len(records), batch_size):
+            batch = records[i:i + batch_size]
+            cursor.executemany(insert_sql, batch)
+        
+        conn.commit()
     
     def comprehensive_bulk_download_workflow(self):
         """
@@ -455,7 +535,132 @@ class ComprehensiveBiodiversityAnalyzer:
         print(f"\n🎉 Bulk download workflow completed!")
         print(f"📊 Total records imported: {imported_count:,}")
         
-        return imported_count
+    def get_sample_data(self):
+        """
+        Create comprehensive sample data for demonstration
+        """
+        print("Creating sample biodiversity data for Indonesian provinces...")
+        
+        # Indonesian provinces
+        provinces = [
+            'Aceh', 'North Sumatra', 'West Sumatra', 'Riau', 'Jambi', 'South Sumatra',
+            'Bengkulu', 'Lampung', 'Bangka Belitung', 'Riau Islands', 'Jakarta',
+            'West Java', 'Central Java', 'East Java', 'Banten', 'Yogyakarta',
+            'Bali', 'West Nusa Tenggara', 'East Nusa Tenggara', 'West Kalimantan',
+            'Central Kalimantan', 'South Kalimantan', 'East Kalimantan', 'North Kalimantan',
+            'North Sulawesi', 'Central Sulawesi', 'South Sulawesi', 'Southeast Sulawesi',
+            'Gorontalo', 'West Sulawesi', 'Maluku', 'North Maluku', 'Papua', 'West Papua'
+        ]
+        
+        # Comprehensive species list for Indonesia
+        species_list = [
+            # Mammals
+            'Panthera tigris sumatrae', 'Elephas maximus sumatranus', 'Rhinoceros sondaicus',
+            'Pongo pygmaeus', 'Pongo abelii', 'Macaca fascicularis', 'Macaca nemestrina',
+            'Sus scrofa', 'Cervus timorensis', 'Bubalus bubalis', 'Bos javanicus',
+            'Paradoxurus hermaphroditus', 'Arctictis binturong', 'Prionailurus bengalensis',
+            
+            # Reptiles
+            'Varanus komodoensis', 'Python reticulatus', 'Python molurus', 'Crocodylus porosus',
+            'Chelonia mydas', 'Eretmochelys imbricata', 'Lepidochelys olivacea',
+            'Gekko gecko', 'Draco volans', 'Calotes versicolor',
+            
+            # Birds
+            'Hirundo rustica', 'Passer domesticus', 'Gallus gallus', 'Ardea cinerea',
+            'Halcyon smyrnensis', 'Pycnonotus aurigaster', 'Anthreptes malacensis',
+            'Buceros rhinoceros', 'Probosciger aterrimus', 'Cacatua moluccensis',
+            'Trichoglossus haematodus', 'Collocalia esculenta',
+            
+            # Fish
+            'Danio rerio', 'Channa striata', 'Oreochromis niloticus', 'Clarias gariepinus',
+            'Rasbora argyrotaenia', 'Barbonymus gonionotus', 'Osphronemus goramy',
+            'Trichopodus trichopterus', 'Helostoma temminckii',
+            
+            # Amphibians
+            'Fejervarya limnocharis', 'Polypedates leucomystax', 'Rhacophorus reinwardtii',
+            'Bufo melanostictus', 'Microhyla palmipes',
+            
+            # Invertebrates
+            'Attacus atlas', 'Ornithoptera priamus', 'Troides helena',
+            'Apis dorsata', 'Vespa tropica', 'Gryllus bimaculatus'
+        ]
+        
+        # Create sample occurrence data with realistic patterns
+        sample_data = []
+        np.random.seed(42)
+        
+        # Different biodiversity patterns for different regions
+        region_multipliers = {
+            'Sumatra': ['Aceh', 'North Sumatra', 'West Sumatra', 'Riau', 'Jambi', 'South Sumatra', 'Bengkulu', 'Lampung'],
+            'Java': ['Jakarta', 'West Java', 'Central Java', 'East Java', 'Banten', 'Yogyakarta'],
+            'Kalimantan': ['West Kalimantan', 'Central Kalimantan', 'South Kalimantan', 'East Kalimantan', 'North Kalimantan'],
+            'Sulawesi': ['North Sulawesi', 'Central Sulawesi', 'South Sulawesi', 'Southeast Sulawesi', 'Gorontalo', 'West Sulawesi'],
+            'Eastern': ['Maluku', 'North Maluku', 'Papua', 'West Papua'],
+            'Lesser_Sunda': ['Bali', 'West Nusa Tenggara', 'East Nusa Tenggara'],
+            'Islands': ['Bangka Belitung', 'Riau Islands']
+        }
+        
+        # Generate different numbers of records per region (biodiversity hotspots)
+        region_record_counts = {
+            'Sumatra': 3000,  # High biodiversity
+            'Kalimantan': 2500,  # High biodiversity
+            'Papua': 2000,  # Very high biodiversity but less sampled
+            'Sulawesi': 1800,  # High endemism
+            'Java': 1500,  # High human impact, lower diversity
+            'Lesser_Sunda': 1000,  # Moderate diversity
+            'Eastern': 800,  # High diversity but remote
+            'Islands': 400   # Small islands, lower diversity
+        }
+        
+        for region, provinces_in_region in region_multipliers.items():
+            total_records = region_record_counts.get(region, 1000)
+            records_per_province = total_records // len(provinces_in_region)
+            
+            for province in provinces_in_region:
+                # Create species abundance distribution (some species are much more common)
+                species_weights = np.random.exponential(scale=2.0, size=len(species_list))
+                species_weights = species_weights / species_weights.sum()
+                
+                for _ in range(records_per_province):
+                    species = np.random.choice(species_list, p=species_weights)
+                    
+                    # Generate coordinates within Indonesia bounds, clustered by region
+                    if region == 'Sumatra':
+                        lat = np.random.normal(-1.0, 2.0)
+                        lng = np.random.normal(101.0, 2.0)
+                    elif region == 'Java':
+                        lat = np.random.normal(-7.0, 1.0)
+                        lng = np.random.normal(108.0, 2.0)
+                    elif region == 'Kalimantan':
+                        lat = np.random.normal(-1.0, 3.0)
+                        lng = np.random.normal(114.0, 3.0)
+                    elif region == 'Sulawesi':
+                        lat = np.random.normal(-2.0, 2.0)
+                        lng = np.random.normal(120.0, 2.0)
+                    elif region == 'Papua':
+                        lat = np.random.normal(-4.0, 2.0)
+                        lng = np.random.normal(138.0, 2.0)
+                    else:
+                        lat = np.random.uniform(self.indonesia_bounds['min_lat'], self.indonesia_bounds['max_lat'])
+                        lng = np.random.uniform(self.indonesia_bounds['min_lng'], self.indonesia_bounds['max_lng'])
+                    
+                    # Ensure coordinates are within bounds
+                    lat = np.clip(lat, self.indonesia_bounds['min_lat'], self.indonesia_bounds['max_lat'])
+                    lng = np.clip(lng, self.indonesia_bounds['min_lng'], self.indonesia_bounds['max_lng'])
+                    
+                    sample_data.append({
+                        'species': species,
+                        'decimalLatitude': lat,
+                        'decimalLongitude': lng,
+                        'stateProvince': province,
+                        'kingdom': 'Animalia',
+                        'phylum': 'Chordata',  # Most of our examples
+                        'class': 'Mammalia'    # Simplified
+                    })
+        
+        self.occurrence_data = pd.DataFrame(sample_data)
+        print(f"Created {len(self.occurrence_data)} sample occurrence records")
+        return self.occurrence_data
             
     def get_existing_record_count(self):
         """Get count of existing records in database"""
@@ -1271,61 +1476,100 @@ def run_comprehensive_analysis():
     Complete workflow for comprehensive biodiversity analysis using bulk downloads
     """
     print("=== COMPREHENSIVE INDONESIAN ANIMALIA BIODIVERSITY ANALYSIS ===\n")
-    print("This analysis will download ALL available animal occurrence data")
-    print("from GBIF for Indonesia using the efficient bulk download API.\n")
+    print("This analysis will use ALL available animal occurrence data")
+    print("from GBIF for Indonesia.\n")
     
-    # Get GBIF credentials
-    print("🔐 GBIF Account Setup Required")
-    print("="*40)
-    print("To download all Indonesian animal data, you need a free GBIF account:")
-    print("1. Register at: https://www.gbif.org/user/profile")
-    print("2. Verify your email")
-    print("3. Enter your credentials below\n")
+    # Initialize analyzer without credentials first to check existing data
+    temp_analyzer = ComprehensiveBiodiversityAnalyzer()
     
-    gbif_username = input("Enter your GBIF username: ").strip()
-    gbif_password = input("Enter your GBIF password: ").strip()
-    gbif_email = input("Enter your GBIF email: ").strip()
+    # Check for existing data first
+    existing_count = temp_analyzer.get_existing_record_count()
+    existing_zips = list(temp_analyzer.data_dir.glob("gbif_indonesia_animals_*.zip"))
+    existing_csvs = list((temp_analyzer.data_dir / "extracted").glob("*.csv"))
     
-    if not all([gbif_username, gbif_password, gbif_email]):
-        print("❌ All credentials are required for bulk downloads!")
-        print("🔄 Falling back to API crawling with sample data...")
+    if existing_count > 0:
+        print(f"📊 Found {existing_count:,} existing records in database.")
+        use_existing = input("Use existing data for analysis? (y/n): ").lower().strip()
         
-        # Initialize analyzer without credentials (will use sample data)
-        analyzer = ComprehensiveBiodiversityAnalyzer()
-        data = analyzer.get_sample_data()
-        
-    else:
-        # Initialize analyzer with credentials
-        analyzer = ComprehensiveBiodiversityAnalyzer(
-            gbif_username=gbif_username,
-            gbif_password=gbif_password, 
-            gbif_email=gbif_email
-        )
-        
-        # Check existing data
-        existing_count = analyzer.get_existing_record_count()
-        if existing_count > 0:
-            print(f"\n📊 Found {existing_count:,} existing records in database.")
-            use_existing = input("Use existing data? (y/n): ").lower().strip()
-            
-            if use_existing != 'y':
-                print("\n🚀 Starting bulk download process...")
-                print("⏳ Expected time: 15-30 minutes (much faster than API crawling!)")
-                
-                # Run bulk download workflow
-                new_records = analyzer.comprehensive_bulk_download_workflow()
-                if new_records == 0:
-                    print("⚠️  Bulk download failed, using existing data...")
-                else:
-                    print(f"✅ Successfully added {new_records:,} new records!")
-            else:
-                print("📊 Using existing data for analysis...")
+        if use_existing == 'y':
+            print("✅ Using existing data for analysis...")
+            analyzer = temp_analyzer
         else:
-            print("\n🚀 No existing data found. Starting bulk download...")
-            print("⏳ Expected time: 15-30 minutes for complete dataset")
-            print("📧 You'll receive email notification when ready")
+            print("🔄 Will get fresh data...")
+            analyzer = None
             
-            # Run bulk download workflow  
+    elif existing_csvs:
+        print(f"📁 Found existing data file: {existing_csvs[0]}")
+        use_existing = input("Import and analyze this data? (y/n): ").lower().strip()
+        
+        if use_existing == 'y':
+            print("📥 Importing existing data file...")
+            imported = temp_analyzer.import_bulk_data_to_database(existing_csvs[0])
+            if imported > 0:
+                print(f"✅ Successfully imported {imported:,} records!")
+                analyzer = temp_analyzer
+            else:
+                print("❌ Import failed, will get fresh data...")
+                analyzer = None
+        else:
+            analyzer = None
+            
+    elif existing_zips:
+        print(f"📦 Found existing download: {existing_zips[0]}")
+        use_existing = input("Extract and analyze this data? (y/n): ").lower().strip()
+        
+        if use_existing == 'y':
+            print("📂 Extracting existing download...")
+            # Convert Path to string for the method
+            data_file = temp_analyzer.download_and_extract_data(str(existing_zips[0]))
+            if data_file:
+                imported = temp_analyzer.import_bulk_data_to_database(data_file)
+                if imported > 0:
+                    print(f"✅ Successfully imported {imported:,} records!")
+                    analyzer = temp_analyzer
+                else:
+                    print("❌ Import failed, will get fresh data...")
+                    analyzer = None
+            else:
+                print("❌ Extraction failed, will get fresh data...")
+                analyzer = None
+        else:
+            analyzer = None
+    else:
+        print("📭 No existing data found.")
+        analyzer = None
+    
+    # Only ask for credentials if we need to download new data
+    if analyzer is None:
+        print("\n🔐 GBIF Account Setup Required")
+        print("="*40)
+        print("To download Indonesian animal data, you need a free GBIF account:")
+        print("1. Register at: https://www.gbif.org/user/profile")
+        print("2. Verify your email")
+        print("3. Enter your credentials below\n")
+        
+        gbif_username = input("Enter your GBIF username: ").strip()
+        gbif_password = input("Enter your GBIF password: ").strip()
+        gbif_email = input("Enter your GBIF email: ").strip()
+        
+        if not all([gbif_username, gbif_password, gbif_email]):
+            print("❌ All credentials are required for bulk downloads!")
+            print("🔄 Using sample data for demonstration...")
+            
+            analyzer = ComprehensiveBiodiversityAnalyzer()
+            data = analyzer.get_sample_data()
+        else:
+            # Initialize analyzer with credentials
+            analyzer = ComprehensiveBiodiversityAnalyzer(
+                gbif_username=gbif_username,
+                gbif_password=gbif_password, 
+                gbif_email=gbif_email
+            )
+            
+            print("\n🚀 Starting bulk download process...")
+            print("⏳ Expected time: 15-30 minutes for new downloads")
+            
+            # Run bulk download workflow
             new_records = analyzer.comprehensive_bulk_download_workflow()
             if new_records == 0:
                 print("❌ Bulk download failed. Using sample data for demonstration...")
