@@ -933,9 +933,31 @@ class FixedSpeciesDistributionModeler:
                 </table>
                 <div style="margin-top: 15px; padding: 10px; background-color: #f5f5dc; border-radius: 5px; font-size: 10px;">
                     <strong>Variable Descriptions:</strong><br>
-                    • <strong>bio1-19:</strong> WorldClim bioclimatic variables (temperature, precipitation patterns)<br>
+                    <strong>Temperature Variables:</strong><br>
+                    • <strong>bio1:</strong> Annual Mean Temperature (°C)<br>
+                    • <strong>bio2:</strong> Mean Diurnal Range (mean of monthly max-min temp)<br>
+                    • <strong>bio3:</strong> Isothermality (bio2/bio7 × 100)<br>
+                    • <strong>bio4:</strong> Temperature Seasonality (std dev × 100)<br>
+                    • <strong>bio5:</strong> Max Temperature of Warmest Month (°C)<br>
+                    • <strong>bio6:</strong> Min Temperature of Coldest Month (°C)<br>
+                    • <strong>bio7:</strong> Temperature Annual Range (bio5-bio6)<br>
+                    • <strong>bio8:</strong> Mean Temperature of Wettest Quarter (°C)<br>
+                    • <strong>bio9:</strong> Mean Temperature of Driest Quarter (°C)<br>
+                    • <strong>bio10:</strong> Mean Temperature of Warmest Quarter (°C)<br>
+                    • <strong>bio11:</strong> Mean Temperature of Coldest Quarter (°C)<br>
+                    <strong>Precipitation Variables:</strong><br>
+                    • <strong>bio12:</strong> Annual Precipitation (mm)<br>
+                    • <strong>bio13:</strong> Precipitation of Wettest Month (mm)<br>
+                    • <strong>bio14:</strong> Precipitation of Driest Month (mm)<br>
+                    • <strong>bio15:</strong> Precipitation Seasonality (coeff of variation)<br>
+                    • <strong>bio16:</strong> Precipitation of Wettest Quarter (mm)<br>
+                    • <strong>bio17:</strong> Precipitation of Driest Quarter (mm)<br>
+                    • <strong>bio18:</strong> Precipitation of Warmest Quarter (mm)<br>
+                    • <strong>bio19:</strong> Precipitation of Coldest Quarter (mm)<br>
+                    <strong>Terrain & Human Variables:</strong><br>
                     • <strong>elevation:</strong> Altitude above sea level (meters)<br>
-                    • <strong>slope, aspect:</strong> Terrain slope and orientation characteristics<br>
+                    • <strong>slope:</strong> Terrain slope (degrees)<br>
+                    • <strong>aspect:</strong> Terrain orientation (degrees 0-360)<br>
                     • <strong>distance_to_coast:</strong> Distance to nearest coastline (km)<br>
                     • <strong>population_density:</strong> Human population density (people/km²)
                 </div>
