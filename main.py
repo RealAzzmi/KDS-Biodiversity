@@ -24,7 +24,7 @@ except ImportError:
     PYGBIF_AVAILABLE = False
 
 class ComprehensiveBiodiversityAnalyzer:
-    def __init__(self, data_dir="biodiversity_data"):
+    def __init__(self, data_dir="biodiversity_data", gbif_username=None, gbif_password=None, gbif_email=None):
         self.indonesia_bounds = {
             'min_lat': -11.0,
             'max_lat': 6.0,
@@ -34,12 +34,24 @@ class ComprehensiveBiodiversityAnalyzer:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(exist_ok=True)
         
+        # GBIF credentials for bulk downloads
+        self.gbif_username = gbif_username
+        self.gbif_password = gbif_password
+        self.gbif_email = gbif_email
+        
         # Database setup for efficient storage and querying
         self.db_path = self.data_dir / "indonesia_biodiversity.db"
         self.setup_database()
         
         self.occurrence_data = None
         self.province_data = None
+        self.download_metadata = {
+            'downloads': [],
+            'total_records': 0,
+            'last_download_key': None
+        }
+        
+        # Fallback crawl metadata for API crawling
         self.crawl_metadata = {
             'total_records': 0,
             'last_offset': 0,
@@ -49,7 +61,7 @@ class ComprehensiveBiodiversityAnalyzer:
         }
         
         # Load existing metadata if available
-        self.load_crawl_metadata()
+        self.load_download_metadata()
         
     def setup_database(self):
         """Setup SQLite database for efficient data storage"""
@@ -113,18 +125,337 @@ class ComprehensiveBiodiversityAnalyzer:
         conn.commit()
         conn.close()
         
-    def load_crawl_metadata(self):
-        """Load existing crawl metadata"""
-        metadata_file = self.data_dir / "crawl_metadata.json"
+    def load_download_metadata(self):
+        """Load existing download metadata"""
+        metadata_file = self.data_dir / "download_metadata.json"
         if metadata_file.exists():
             with open(metadata_file, 'r') as f:
+                self.download_metadata = json.load(f)
+        
+        # Also load crawl metadata for fallback
+        crawl_metadata_file = self.data_dir / "crawl_metadata.json"
+        if crawl_metadata_file.exists():
+            with open(crawl_metadata_file, 'r') as f:
                 self.crawl_metadata = json.load(f)
                 
+    def save_download_metadata(self):
+        """Save download metadata"""
+        metadata_file = self.data_dir / "download_metadata.json"
+        with open(metadata_file, 'w') as f:
+            json.dump(self.download_metadata, f, indent=2, default=str)
+    
     def save_crawl_metadata(self):
         """Save crawl metadata"""
         metadata_file = self.data_dir / "crawl_metadata.json"
         with open(metadata_file, 'w') as f:
             json.dump(self.crawl_metadata, f, indent=2, default=str)
+            
+    def request_gbif_bulk_download(self):
+        """
+        Request bulk download of all Indonesian animal data using GBIF Download API
+        """
+        if not all([self.gbif_username, self.gbif_password, self.gbif_email]):
+            print("❌ GBIF credentials required for bulk downloads!")
+            print("\n🔐 To use bulk downloads, you need:")
+            print("1. Register at: https://www.gbif.org/user/profile")
+            print("2. Get your username, password, and email")
+            print("3. Initialize with: analyzer = ComprehensiveBiodiversityAnalyzer(")
+            print("     gbif_username='your_username',")
+            print("     gbif_password='your_password',")
+            print("     gbif_email='your@email.com')")
+            print("\n⚠️  Falling back to API crawling method...")
+            return None
+            
+        print("🚀 Requesting GBIF bulk download for Indonesian animals...")
+        
+        # Create download request
+        download_request = {
+            "creator": self.gbif_username,
+            "notificationAddresses": [self.gbif_email],
+            "sendNotification": True,
+            "format": "SIMPLE_CSV",
+            "predicate": {
+                "type": "and",
+                "predicates": [
+                    {
+                        "type": "equals",
+                        "key": "COUNTRY",
+                        "value": "ID"  # Indonesia
+                    },
+                    {
+                        "type": "equals",
+                        "key": "KINGDOM_KEY",  # Fixed: use KINGDOM_KEY instead of KINGDOM
+                        "value": "1"  # Animalia kingdom key in GBIF
+                    },
+                    {
+                        "type": "equals",
+                        "key": "HAS_COORDINATE",
+                        "value": "true"
+                    },
+                    {
+                        "type": "equals",
+                        "key": "HAS_GEOSPATIAL_ISSUE",
+                        "value": "false"
+                    }
+                ]
+            }
+        }
+        
+        # Submit download request
+        url = "https://api.gbif.org/v1/occurrence/download/request"
+        
+        try:
+            response = requests.post(
+                url,
+                json=download_request,
+                auth=(self.gbif_username, self.gbif_password),
+                headers={"Content-Type": "application/json"},
+                timeout=30
+            )
+            
+            if response.status_code == 201:
+                download_key = response.text.strip().strip('"')
+                print(f"✅ Download request submitted successfully!")
+                print(f"📋 Download key: {download_key}")
+                print(f"📧 You'll receive an email at {self.gbif_email} when ready")
+                
+                # Save download info
+                download_info = {
+                    'download_key': download_key,
+                    'request_time': datetime.now(),
+                    'status': 'RUNNING',
+                    'request': download_request
+                }
+                
+                self.download_metadata['downloads'].append(download_info)
+                self.download_metadata['last_download_key'] = download_key
+                self.save_download_metadata()
+                
+                return download_key
+                
+            else:
+                print(f"❌ Download request failed: {response.status_code}")
+                print(f"Response: {response.text}")
+                return None
+                
+        except Exception as e:
+            print(f"❌ Error submitting download request: {e}")
+            return None
+    
+    def check_download_status(self, download_key):
+        """Check the status of a GBIF download"""
+        url = f"https://api.gbif.org/v1/occurrence/download/{download_key}"
+        
+        try:
+            response = requests.get(url, timeout=30)
+            if response.status_code == 200:
+                download_info = response.json()
+                return download_info
+            else:
+                print(f"Error checking download status: {response.status_code}")
+                return None
+        except Exception as e:
+            print(f"Error checking download status: {e}")
+            return None
+    
+    def wait_for_download_completion(self, download_key, check_interval=60):
+        """
+        Wait for download to complete, checking status periodically
+        """
+        print(f"⏳ Waiting for download {download_key} to complete...")
+        print(f"🔄 Checking every {check_interval} seconds...")
+        
+        start_time = time.time()
+        
+        while True:
+            status_info = self.check_download_status(download_key)
+            
+            if status_info:
+                status = status_info.get('status')
+                total_records = status_info.get('totalRecords', 0)
+                
+                elapsed = int(time.time() - start_time)
+                print(f"📊 Status: {status} | Records: {total_records:,} | Elapsed: {elapsed//60}m {elapsed%60}s")
+                
+                if status == 'SUCCEEDED':
+                    download_link = status_info.get('downloadLink')
+                    size_mb = status_info.get('size', 0) / (1024 * 1024)
+                    
+                    print(f"✅ Download completed!")
+                    print(f"📁 File size: {size_mb:.1f} MB")
+                    print(f"🔗 Download link: {download_link}")
+                    print(f"🏷️  DOI: {status_info.get('doi', 'Not assigned')}")
+                    
+                    # Update metadata
+                    for download in self.download_metadata['downloads']:
+                        if download['download_key'] == download_key:
+                            download.update({
+                                'status': 'SUCCEEDED',
+                                'completion_time': datetime.now(),
+                                'total_records': total_records,
+                                'download_link': download_link,
+                                'size_bytes': status_info.get('size', 0),
+                                'doi': status_info.get('doi')
+                            })
+                            break
+                    
+                    self.save_download_metadata()
+                    return download_link
+                    
+                elif status == 'FAILED':
+                    print(f"❌ Download failed!")
+                    return None
+                    
+                elif status == 'CANCELLED':
+                    print(f"⚠️  Download was cancelled!")
+                    return None
+                    
+                else:  # RUNNING, PREPARING
+                    time.sleep(check_interval)
+                    
+            else:
+                print("❌ Could not check download status")
+                time.sleep(check_interval)
+    
+    def download_and_extract_data(self, download_link):
+        """
+        Download and extract the GBIF data file
+        """
+        print(f"📥 Downloading data file...")
+        
+        # Download the file
+        zip_filename = self.data_dir / f"gbif_indonesia_animals_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+        
+        try:
+            response = requests.get(download_link, stream=True, timeout=300)
+            response.raise_for_status()
+            
+            total_size = int(response.headers.get('content-length', 0))
+            downloaded = 0
+            
+            with open(zip_filename, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        
+                        if total_size > 0:
+                            progress = (downloaded / total_size) * 100
+                            print(f"\r📥 Download progress: {progress:.1f}% ({downloaded/1024/1024:.1f}/{total_size/1024/1024:.1f} MB)", end='')
+            
+            print(f"\n✅ Download completed: {zip_filename}")
+            
+            # Extract the ZIP file
+            print("📂 Extracting data...")
+            import zipfile
+            
+            extract_dir = self.data_dir / "extracted"
+            extract_dir.mkdir(exist_ok=True)
+            
+            with zipfile.ZipFile(zip_filename, 'r') as zip_ref:
+                zip_ref.extractall(extract_dir)
+                
+            # Find the occurrence data file
+            occurrence_files = list(extract_dir.glob("*.csv"))
+            if not occurrence_files:
+                occurrence_files = list(extract_dir.glob("occurrence.txt"))
+                
+            if occurrence_files:
+                data_file = occurrence_files[0]
+                print(f"📊 Found data file: {data_file}")
+                return data_file
+            else:
+                print("❌ Could not find occurrence data file in the download")
+                return None
+                
+        except Exception as e:
+            print(f"❌ Error downloading/extracting data: {e}")
+            return None
+    
+    def import_bulk_data_to_database(self, data_file):
+        """
+        Import the bulk downloaded data into our database
+        """
+        print(f"📥 Importing data from {data_file} into database...")
+        
+        try:
+            # Read the CSV file in chunks to handle large files
+            chunk_size = 10000
+            total_imported = 0
+            
+            # Get file size for progress tracking
+            file_size = os.path.getsize(data_file)
+            processed_bytes = 0
+            
+            conn = sqlite3.connect(self.db_path)
+            
+            for chunk_num, chunk in enumerate(pd.read_csv(data_file, sep='\t', chunksize=chunk_size, low_memory=False)):
+                # Clean and prepare data
+                chunk = chunk.dropna(subset=['species', 'decimalLatitude', 'decimalLongitude'])
+                
+                # Filter by Indonesia bounds
+                chunk = chunk[
+                    (chunk['decimalLatitude'].between(self.indonesia_bounds['min_lat'], self.indonesia_bounds['max_lat'])) &
+                    (chunk['decimalLongitude'].between(self.indonesia_bounds['min_lng'], self.indonesia_bounds['max_lng']))
+                ]
+                
+                if len(chunk) > 0:
+                    # Add download session info
+                    chunk['crawl_session'] = f"bulk_download_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    
+                    # Import to database
+                    chunk.to_sql('occurrences', conn, if_exists='append', index=False, method='multi')
+                    total_imported += len(chunk)
+                
+                # Progress update
+                processed_bytes += chunk_size * 1000  # Rough estimate
+                if file_size > 0:
+                    progress = min(100, (processed_bytes / file_size) * 100)
+                    print(f"\r📥 Import progress: {progress:.1f}% | Imported: {total_imported:,} records", end='')
+            
+            conn.close()
+            
+            print(f"\n✅ Successfully imported {total_imported:,} records to database")
+            self.download_metadata['total_records'] = total_imported
+            self.save_download_metadata()
+            
+            return total_imported
+            
+        except Exception as e:
+            print(f"❌ Error importing data: {e}")
+            return 0
+    
+    def comprehensive_bulk_download_workflow(self):
+        """
+        Complete workflow using GBIF bulk download API
+        """
+        print("🚀 Starting comprehensive bulk download workflow...")
+        
+        # Step 1: Request download
+        download_key = self.request_gbif_bulk_download()
+        if not download_key:
+            print("⚠️  Bulk download failed, falling back to API crawling...")
+            return self.comprehensive_gbif_crawl(max_records=100000)
+        
+        # Step 2: Wait for completion
+        download_link = self.wait_for_download_completion(download_key)
+        if not download_link:
+            print("❌ Download failed or was cancelled")
+            return 0
+        
+        # Step 3: Download and extract
+        data_file = self.download_and_extract_data(download_link)
+        if not data_file:
+            print("❌ Could not download or extract data file")
+            return 0
+        
+        # Step 4: Import to database
+        imported_count = self.import_bulk_data_to_database(data_file)
+        
+        print(f"\n🎉 Bulk download workflow completed!")
+        print(f"📊 Total records imported: {imported_count:,}")
+        
+        return imported_count
             
     def get_existing_record_count(self):
         """Get count of existing records in database"""
@@ -937,47 +1268,70 @@ class ComprehensiveBiodiversityAnalyzer:
 
 def run_comprehensive_analysis():
     """
-    Complete workflow for comprehensive biodiversity analysis
+    Complete workflow for comprehensive biodiversity analysis using bulk downloads
     """
     print("=== COMPREHENSIVE INDONESIAN ANIMALIA BIODIVERSITY ANALYSIS ===\n")
-    print("This analysis will attempt to crawl ALL available animal occurrence data")
-    print("from GBIF for Indonesia and perform comprehensive biodiversity analysis.\n")
+    print("This analysis will download ALL available animal occurrence data")
+    print("from GBIF for Indonesia using the efficient bulk download API.\n")
     
-    # Initialize analyzer
-    analyzer = ComprehensiveBiodiversityAnalyzer()
+    # Get GBIF credentials
+    print("🔐 GBIF Account Setup Required")
+    print("="*40)
+    print("To download all Indonesian animal data, you need a free GBIF account:")
+    print("1. Register at: https://www.gbif.org/user/profile")
+    print("2. Verify your email")
+    print("3. Enter your credentials below\n")
     
-    # Print current database status
-    analyzer.print_database_statistics()
+    gbif_username = input("Enter your GBIF username: ").strip()
+    gbif_password = input("Enter your GBIF password: ").strip()
+    gbif_email = input("Enter your GBIF email: ").strip()
     
-    # Ask user if they want to crawl more data
-    existing_count = analyzer.get_existing_record_count()
-    
-    if existing_count > 0:
-        print(f"\nFound {existing_count:,} existing records in database.")
-        crawl_more = input("Do you want to crawl additional data? (y/n): ").lower().strip()
+    if not all([gbif_username, gbif_password, gbif_email]):
+        print("❌ All credentials are required for bulk downloads!")
+        print("🔄 Falling back to API crawling with sample data...")
         
-        if crawl_more == 'y':
-            max_new_records = input("Enter maximum new records to crawl (or press Enter for unlimited): ").strip()
-            max_new_records = int(max_new_records) if max_new_records.isdigit() else None
-            
-            print(f"\nStarting comprehensive crawl...")
-            print("Note: This may take several hours to complete for all available data.")
-            print("The process is resumable - you can stop and restart anytime.")
-            
-            # Start crawling
-            new_records = analyzer.comprehensive_gbif_crawl(max_records=max_new_records, resume=True)
-            print(f"\nCrawl completed! Added {new_records:,} new records.")
-        else:
-            print("Using existing data for analysis...")
+        # Initialize analyzer without credentials (will use sample data)
+        analyzer = ComprehensiveBiodiversityAnalyzer()
+        data = analyzer.get_sample_data()
+        
     else:
-        print("No existing data found. Starting fresh crawl...")
-        print("Note: This will take several hours to crawl all available data.")
+        # Initialize analyzer with credentials
+        analyzer = ComprehensiveBiodiversityAnalyzer(
+            gbif_username=gbif_username,
+            gbif_password=gbif_password, 
+            gbif_email=gbif_email
+        )
         
-        # Start crawling
-        new_records = analyzer.comprehensive_gbif_crawl(max_records=50000, resume=False)  # Start with reasonable limit
-        print(f"\nInitial crawl completed! Collected {new_records:,} records.")
+        # Check existing data
+        existing_count = analyzer.get_existing_record_count()
+        if existing_count > 0:
+            print(f"\n📊 Found {existing_count:,} existing records in database.")
+            use_existing = input("Use existing data? (y/n): ").lower().strip()
+            
+            if use_existing != 'y':
+                print("\n🚀 Starting bulk download process...")
+                print("⏳ Expected time: 15-30 minutes (much faster than API crawling!)")
+                
+                # Run bulk download workflow
+                new_records = analyzer.comprehensive_bulk_download_workflow()
+                if new_records == 0:
+                    print("⚠️  Bulk download failed, using existing data...")
+                else:
+                    print(f"✅ Successfully added {new_records:,} new records!")
+            else:
+                print("📊 Using existing data for analysis...")
+        else:
+            print("\n🚀 No existing data found. Starting bulk download...")
+            print("⏳ Expected time: 15-30 minutes for complete dataset")
+            print("📧 You'll receive email notification when ready")
+            
+            # Run bulk download workflow  
+            new_records = analyzer.comprehensive_bulk_download_workflow()
+            if new_records == 0:
+                print("❌ Bulk download failed. Using sample data for demonstration...")
+                data = analyzer.get_sample_data()
     
-    # Load data and analyze
+    # Continue with analysis...
     print("\nStep 1: Loading data from database...")
     data = analyzer.load_all_data_from_database()
     
@@ -987,7 +1341,7 @@ def run_comprehensive_analysis():
     
     print(f"Loaded {len(data):,} occurrence records for analysis")
     
-    # Analyze biodiversity
+    # Rest of analysis remains the same...
     print("\nStep 2: Calculating Shannon indices for each province...")
     biodiversity_results = analyzer.analyze_biodiversity_by_province()
     
@@ -995,11 +1349,9 @@ def run_comprehensive_analysis():
         print("Failed to analyze biodiversity")
         return None, None
     
-    # Generate comprehensive summary statistics
     print("\nStep 3: Generating comprehensive summary statistics...")
     summary_stats = analyzer.generate_comprehensive_summary_statistics()
     
-    # Create interactive map
     print("\nStep 4: Creating comprehensive interactive map...")
     biodiversity_map = analyzer.create_interactive_map()
     
@@ -1007,13 +1359,10 @@ def run_comprehensive_analysis():
         map_filename = "indonesia_comprehensive_biodiversity_map.html"
         biodiversity_map.save(map_filename)
         print(f"\n✅ Comprehensive interactive map saved as '{map_filename}'")
-        print("   This map includes detailed popups with taxonomic information!")
     
-    # Export comprehensive results
     print("\nStep 5: Exporting comprehensive results...")
     export_df = analyzer.export_comprehensive_results()
     
-    # Print final database statistics
     print("\nStep 6: Final database summary...")
     analyzer.print_database_statistics()
     
@@ -1022,30 +1371,30 @@ def run_comprehensive_analysis():
     print("COMPREHENSIVE ANALYSIS COMPLETE! 🎉")
     print("="*80)
     print("Files generated:")
-    print("1. indonesia_comprehensive_biodiversity_map.html - Interactive map with detailed province data")
+    print("1. indonesia_comprehensive_biodiversity_map.html - Interactive map")
     print("2. indonesia_comprehensive_biodiversity_results.csv - Summary results")
     print("3. indonesia_comprehensive_biodiversity_results.xlsx - Detailed Excel workbook")
     print("4. indonesia_comprehensive_biodiversity_database_stats.json - Database statistics")
     print("5. biodiversity_data/indonesia_biodiversity.db - SQLite database with all records")
     
-    print(f"\n📊 Key Findings:")
     if summary_stats is not None:
         total_species = analyzer.get_database_statistics()['unique_species']
         total_records = analyzer.get_database_statistics()['total_records']
         avg_shannon = summary_stats['Shannon_Index'].mean()
         most_diverse = summary_stats.loc[summary_stats['Shannon_Index'].idxmax(), 'Province']
         
+        print(f"\n📊 Key Findings:")
         print(f"- Total unique animal species documented: {total_species:,}")
         print(f"- Total occurrence records analyzed: {total_records:,}")
         print(f"- Average Shannon diversity index: {avg_shannon:.4f}")
         print(f"- Most biodiverse province: {most_diverse}")
     
     print(f"\n🔬 For your research:")
-    print("- The SQLite database contains all raw occurrence data for further analysis")
-    print("- Export custom queries from the database for specific taxonomic groups")
-    print("- Use the Excel file for statistical analysis and visualization")
-    print("- Reference the comprehensive methodology in your paper")
-    print("- The interactive map provides visual evidence for geographic patterns")
+    print("- Complete dataset of Indonesian animal biodiversity from GBIF")
+    print("- All records include coordinates, taxonomy, and collection metadata")
+    print("- Cite the GBIF download DOI in your paper")
+    print("- Use the interactive map for visualizing geographic patterns")
+    print("- Database allows custom queries for specific research questions")
     
     return analyzer, export_df
 
