@@ -4,16 +4,20 @@ import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+from sklearn.neighbors import NearestNeighbors
 import folium
 from folium import plugins
 import json
 import pickle
+import struct
 from pathlib import Path
 from collections import Counter
 import warnings
+import time
+from datetime import datetime
 warnings.filterwarnings('ignore')
 
-class SpeciesDistributionModeler:
+class FixedSpeciesDistributionModeler:
     def __init__(self, db_path="biodiversity_data/indonesia_biodiversity.db", 
                  results_dir="sdm_results"):
         self.db_path = db_path
@@ -28,7 +32,12 @@ class SpeciesDistributionModeler:
             'max_lng': 141.0
         }
         
-        # Environmental variables for modeling (updated to match what we actually have)
+        # Initialize data containers
+        self.environmental_data = None
+        self.env_nn_model = None
+        self.species_models = {}
+        
+        # Environmental variables for modeling
         self.env_variables = [
             'bio1', 'bio2', 'bio3', 'bio4', 'bio5', 'bio6', 'bio7', 'bio8',
             'bio9', 'bio10', 'bio11', 'bio12', 'bio13', 'bio14', 'bio15',
@@ -36,265 +45,408 @@ class SpeciesDistributionModeler:
             'aspect', 'distance_to_coast', 'population_density'
         ]
         
-        self.species_models = {}
-        self.environmental_data = None
-        self.prediction_grid = None
+    def convert_blob_to_float(self, blob_data):
+        """Convert binary blob data to float using struct unpacking"""
+        if blob_data is None:
+            return np.nan
         
-    def check_environmental_data(self):
-        """Check what environmental data is actually available"""
-        print("🔍 Checking available environmental data...")
+        try:
+            # Try to unpack as float (4 bytes, little endian)
+            if len(blob_data) == 4:
+                return struct.unpack('<f', blob_data)[0]
+            # Try to unpack as double (8 bytes, little endian)
+            elif len(blob_data) == 8:
+                return struct.unpack('<d', blob_data)[0]
+            else:
+                return np.nan
+        except (struct.error, TypeError):
+            return np.nan
+    
+    def fix_environmental_data_in_db(self):
+        """Fix the environmental data by converting blobs to proper floats"""
+        print("🔧 Fixing environmental data in database...")
         
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        # Check if table exists
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='environmental_data'")
-        if not cursor.fetchone():
-            print("❌ No environmental_data table found!")
-            print("   Please run the environmental data processor first.")
-            return False
+        # First, get all data with blob columns
+        cursor.execute("SELECT * FROM environmental_data")
+        rows = cursor.fetchall()
         
-        # Check columns
+        # Get column names
+        cursor.execute("PRAGMA table_info(environmental_data)")
+        columns_info = cursor.fetchall()
+        column_names = [row[1] for row in columns_info]
+        
+        print(f"📊 Processing {len(rows)} rows with {len(column_names)} columns...")
+        
+        # Process each row
+        fixed_rows = []
+        for row in rows:
+            fixed_row = list(row)
+            
+            for i, (col_name, value) in enumerate(zip(column_names, row)):
+                if col_name in self.env_variables and isinstance(value, bytes):
+                    # Convert blob to float
+                    fixed_value = self.convert_blob_to_float(value)
+                    fixed_row[i] = fixed_value
+            
+            fixed_rows.append(tuple(fixed_row))
+        
+        # Clear and rebuild the table with correct data
+        print("🗑️  Clearing old data...")
+        cursor.execute("DELETE FROM environmental_data")
+        
+        # Re-insert fixed data
+        print("💾 Inserting fixed data...")
+        placeholders = ', '.join(['?' for _ in column_names])
+        cursor.executemany(
+            f"INSERT INTO environmental_data ({', '.join(column_names)}) VALUES ({placeholders})",
+            fixed_rows
+        )
+        
+        conn.commit()
+        conn.close()
+        
+        print("✅ Environmental data fixed!")
+        
+    def load_and_prepare_environmental_data(self):
+        """Load environmental data and prepare for fast matching"""
+        print("📊 Loading and preparing environmental data...")
+        
+        # First, try to fix the data if it's corrupted
+        print("🔍 Checking for binary data corruption...")
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Check if we have blob data in bioclimatic variables
+        cursor.execute("SELECT bio1 FROM environmental_data LIMIT 1")
+        sample = cursor.fetchone()
+        
+        if sample and isinstance(sample[0], bytes):
+            print("🔧 Detected binary blob data - fixing...")
+            conn.close()
+            self.fix_environmental_data_in_db()
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+        
+        # Check available columns
         cursor.execute("PRAGMA table_info(environmental_data)")
         available_columns = [row[1] for row in cursor.fetchall()]
         
-        # Check row count
-        cursor.execute("SELECT COUNT(*) FROM environmental_data")
-        row_count = cursor.fetchone()[0]
-        
-        print(f"✅ Environmental data table found with {row_count:,} records")
-        print(f"📋 Available columns: {available_columns}")
+        if not available_columns:
+            print("❌ No environmental_data table found!")
+            conn.close()
+            return False
         
         # Update env_variables to only include available columns
         self.env_variables = [col for col in self.env_variables if col in available_columns]
-        print(f"✅ Will use {len(self.env_variables)} environmental variables for modeling")
         
-        conn.close()
-        return row_count > 0
+        if len(self.env_variables) < 3:
+            print("❌ Insufficient environmental variables available!")
+            conn.close()
+            return False
         
-    def load_environmental_data(self):
-        """Load environmental data from database"""
-        print("📊 Loading environmental data...")
+        print(f"🔍 Found {len(self.env_variables)} environmental variables")
         
-        if not self.check_environmental_data():
-            return None
-        
-        conn = sqlite3.connect(self.db_path)
-        
-        # Build query with only available columns
+        # Load environmental data efficiently
         env_vars_str = ', '.join(self.env_variables)
         query = f"""
         SELECT latitude, longitude, {env_vars_str}
         FROM environmental_data
         WHERE latitude IS NOT NULL 
         AND longitude IS NOT NULL
-        AND ({' IS NOT NULL OR '.join(self.env_variables[:5])} IS NOT NULL)
         """
         
-        self.environmental_data = pd.read_sql_query(query, conn)
-        conn.close()
+        try:
+            self.environmental_data = pd.read_sql_query(query, conn)
+            conn.close()
+        except Exception as e:
+            print(f"❌ Error loading environmental data: {e}")
+            conn.close()
+            return False
         
-        print(f"✅ Loaded {len(self.environmental_data)} environmental data points")
-        print(f"📊 Environmental variables: {', '.join(self.env_variables)}")
-        return self.environmental_data
-    
-    def get_species_list(self, min_occurrences=20):
-        """Get list of species with sufficient occurrence records"""
+        if len(self.environmental_data) == 0:
+            print("❌ No environmental data found!")
+            return False
+        
+        print(f"📊 Loaded {len(self.environmental_data)} raw environmental records")
+        
+        # Convert all environmental variables to numeric
+        print("🧹 Converting data types...")
+        for var in self.env_variables:
+            if var in self.environmental_data.columns:
+                self.environmental_data[var] = pd.to_numeric(
+                    self.environmental_data[var], 
+                    errors='coerce'
+                )
+        
+        # Check for missing data
+        print("📊 Data quality check:")
+        valid_vars = []
+        for var in self.env_variables:
+            if var in self.environmental_data.columns:
+                valid_count = self.environmental_data[var].notna().sum()
+                valid_pct = (valid_count / len(self.environmental_data)) * 100
+                print(f"   {var}: {valid_count}/{len(self.environmental_data)} ({valid_pct:.1f}%) valid")
+                
+                if valid_pct > 10:  # Keep variables with >10% valid data
+                    valid_vars.append(var)
+                else:
+                    print(f"   ❌ Dropping {var} - insufficient valid data")
+        
+        self.env_variables = valid_vars
+        
+        if len(self.env_variables) < 3:
+            print(f"❌ Insufficient valid environmental variables ({len(self.env_variables)})")
+            return False
+        
+        # Remove rows with too many missing values
+        min_vars_required = max(3, len(self.env_variables) // 3)
+        initial_count = len(self.environmental_data)
+        
+        self.environmental_data = self.environmental_data.dropna(
+            subset=self.env_variables, 
+            thresh=min_vars_required
+        )
+        
+        removed_count = initial_count - len(self.environmental_data)
+        if removed_count > 0:
+            print(f"   🗑️  Removed {removed_count} rows with insufficient data")
+        
+        if len(self.environmental_data) < 50:
+            print(f"❌ Insufficient environmental data ({len(self.environmental_data)} points)")
+            return False
+        
+        # Fill missing values with median
+        print("🔧 Filling missing values...")
+        for var in self.env_variables:
+            if var in self.environmental_data.columns:
+                missing_count = self.environmental_data[var].isna().sum()
+                if missing_count > 0:
+                    median_val = self.environmental_data[var].median()
+                    self.environmental_data[var] = self.environmental_data[var].fillna(median_val)
+                    print(f"   📊 Filled {missing_count} missing values in {var}")
+        
+        # Create spatial index
+        print("🔍 Creating spatial index...")
+        try:
+            coords = self.environmental_data[['latitude', 'longitude']].values
+            self.env_nn_model = NearestNeighbors(n_neighbors=1, algorithm='ball_tree', metric='haversine')
+            self.env_nn_model.fit(np.radians(coords))
+        except Exception as e:
+            print(f"❌ Error creating spatial index: {e}")
+            return False
+        
+        print(f"✅ Successfully prepared {len(self.environmental_data)} environmental points")
+        print(f"📊 Using {len(self.env_variables)} variables: {', '.join(self.env_variables)}")
+        
+        return True
+        
+    def get_species_list_optimized(self, min_occurrences=20, max_species=None):
+        """Get list of species with sufficient occurrence records - optimized query"""
         print(f"🔍 Finding species with at least {min_occurrences} occurrences...")
         
         conn = sqlite3.connect(self.db_path)
+        
+        limit_clause = f"LIMIT {max_species}" if max_species else ""
         
         query = f"""
         SELECT species, COUNT(*) as occurrence_count
         FROM occurrences 
         WHERE species IS NOT NULL 
-        AND decimalLatitude IS NOT NULL 
-        AND decimalLongitude IS NOT NULL
+        AND decimalLatitude BETWEEN {self.indonesia_bounds['min_lat']} AND {self.indonesia_bounds['max_lat']}
+        AND decimalLongitude BETWEEN {self.indonesia_bounds['min_lng']} AND {self.indonesia_bounds['max_lng']}
         GROUP BY species
         HAVING COUNT(*) >= {min_occurrences}
         ORDER BY COUNT(*) DESC
+        {limit_clause}
         """
         
         species_counts = pd.read_sql_query(query, conn)
         conn.close()
         
         print(f"✅ Found {len(species_counts)} species with ≥{min_occurrences} occurrences")
-        print(f"Top 10 most common species:")
-        for i, (_, row) in enumerate(species_counts.head(10).iterrows(), 1):
-            print(f"  {i:2d}. {row['species']:<40} ({row['occurrence_count']:,} records)")
-        
-        return species_counts['species'].tolist()
+        return species_counts
     
-    def prepare_species_data(self, species_name):
-        """Prepare training data for a specific species"""
-        print(f"📋 Preparing data for {species_name}...")
+    def load_all_occurrence_data(self, species_list):
+        """Load all occurrence data for selected species at once"""
+        print("📋 Loading all occurrence data...")
         
-        if self.environmental_data is None:
-            self.load_environmental_data()
-        
-        if self.environmental_data is None:
-            print("❌ No environmental data available")
-            return None
+        species_str = "', '".join(species_list)
         
         conn = sqlite3.connect(self.db_path)
-        
-        # Get presence points for the species
-        presence_query = f"""
-        SELECT DISTINCT decimalLatitude as latitude, decimalLongitude as longitude
+        query = f"""
+        SELECT species, decimalLatitude as latitude, decimalLongitude as longitude
         FROM occurrences 
-        WHERE species = ? 
-        AND decimalLatitude IS NOT NULL 
-        AND decimalLongitude IS NOT NULL
+        WHERE species IN ('{species_str}')
         AND decimalLatitude BETWEEN {self.indonesia_bounds['min_lat']} AND {self.indonesia_bounds['max_lat']}
         AND decimalLongitude BETWEEN {self.indonesia_bounds['min_lng']} AND {self.indonesia_bounds['max_lng']}
         """
         
-        presence_points = pd.read_sql_query(presence_query, conn, params=(species_name,))
+        all_occurrences = pd.read_sql_query(query, conn)
         conn.close()
         
-        print(f"  Found {len(presence_points)} presence points")
+        # Remove duplicates within species
+        all_occurrences = all_occurrences.drop_duplicates(subset=['species', 'latitude', 'longitude'])
+        
+        print(f"✅ Loaded {len(all_occurrences)} unique occurrence records")
+        return all_occurrences
+    
+    def fast_environmental_matching(self, occurrence_points):
+        """Fast environmental matching using nearest neighbors"""
+        if len(occurrence_points) == 0:
+            return pd.DataFrame()
+        
+        # Convert to radians for haversine distance
+        coords_rad = np.radians(occurrence_points[['latitude', 'longitude']].values)
+        
+        # Find nearest environmental points
+        distances, indices = self.env_nn_model.kneighbors(coords_rad)
+        
+        # Convert distances back to degrees (approximately)
+        distances_deg = distances[:, 0] * 180 / np.pi
+        
+        # Filter points that are too far (>0.5 degrees ~55km)
+        valid_mask = distances_deg < 0.5
+        
+        if not np.any(valid_mask):
+            return pd.DataFrame()
+        
+        # Get matched environmental data
+        valid_indices = indices[valid_mask, 0]
+        matched_env_data = self.environmental_data.iloc[valid_indices].copy().reset_index(drop=True)
+        
+        # Add original occurrence info INCLUDING the presence column
+        valid_occurrences = occurrence_points[valid_mask].reset_index(drop=True)
+        for col in valid_occurrences.columns:
+            matched_env_data[col] = valid_occurrences[col].values
+        
+        return matched_env_data
+    
+    def generate_pseudo_absences_vectorized(self, presence_points, n_pseudoabsences, buffer_distance=0.1):
+        """Generate pseudo-absences using vectorized operations"""
+        np.random.seed(42)
+        
+        # Pre-generate many random points
+        n_candidates = n_pseudoabsences * 3
+        
+        candidate_lats = np.random.uniform(
+            self.indonesia_bounds['min_lat'], 
+            self.indonesia_bounds['max_lat'], 
+            n_candidates
+        )
+        candidate_lngs = np.random.uniform(
+            self.indonesia_bounds['min_lng'], 
+            self.indonesia_bounds['max_lng'], 
+            n_candidates
+        )
+        
+        # Vectorized distance calculation to all presence points
+        presence_coords = presence_points[['latitude', 'longitude']].values
+        
+        valid_absences = []
+        for i in range(n_candidates):
+            if len(valid_absences) >= n_pseudoabsences:
+                break
+                
+            candidate = np.array([candidate_lats[i], candidate_lngs[i]])
+            
+            # Calculate distances to all presence points
+            distances = np.sqrt(np.sum((presence_coords - candidate)**2, axis=1))
+            
+            # Check if far enough from all presence points
+            if np.min(distances) >= buffer_distance:
+                valid_absences.append({
+                    'latitude': candidate_lats[i], 
+                    'longitude': candidate_lngs[i]
+                })
+        
+        return pd.DataFrame(valid_absences[:n_pseudoabsences])
+    
+    def prepare_training_data_batch(self, all_occurrences, species_name):
+        """Prepare training data for a species using batch processing"""
+        # Get presence points for this species
+        species_presences = all_occurrences[
+            all_occurrences['species'] == species_name
+        ][['latitude', 'longitude']].drop_duplicates()
+        
+        if len(species_presences) < 10:
+            return None
         
         # Generate pseudo-absences
-        n_pseudoabsences = min(len(presence_points) * 3, 1000)  # 3:1 ratio, max 1000
-        pseudo_absences = self.generate_pseudo_absences(presence_points, n_pseudoabsences)
+        n_pseudoabsences = min(len(species_presences) * 2, 300)
+        pseudo_absences = self.generate_pseudo_absences_vectorized(
+            species_presences, n_pseudoabsences
+        )
         
-        print(f"  Generated {len(pseudo_absences)} pseudo-absence points")
+        if len(pseudo_absences) < 10:
+            return None
         
         # Combine presence and absence points
-        presence_points['presence'] = 1
+        species_presences['presence'] = 1
         pseudo_absences['presence'] = 0
         
-        all_points = pd.concat([presence_points, pseudo_absences], ignore_index=True)
+        all_points = pd.concat([species_presences, pseudo_absences], ignore_index=True)
         
-        # Match with environmental data
-        training_data = self.match_with_environmental_data(all_points)
+        # Fast environmental matching
+        training_data = self.fast_environmental_matching(all_points)
         
-        if training_data is None or len(training_data) < 20:
-            print(f"  ⚠️  Insufficient training data ({len(training_data) if training_data is not None else 0} points)")
+        if len(training_data) < 20:
             return None
         
-        print(f"  ✅ Prepared {len(training_data)} training points")
         return training_data
     
-    def generate_pseudo_absences(self, presence_points, n_pseudoabsences):
-        """Generate pseudo-absence points using random sampling"""
-        np.random.seed(42)  # For reproducibility
-        
-        # Create buffer around presence points to avoid pseudo-absences too close
-        buffer_distance = 0.1  # degrees (~11 km)
-        
-        pseudo_absences = []
-        max_attempts = n_pseudoabsences * 10
-        attempts = 0
-        
-        while len(pseudo_absences) < n_pseudoabsences and attempts < max_attempts:
-            # Random point within Indonesia bounds
-            lat = np.random.uniform(self.indonesia_bounds['min_lat'], 
-                                  self.indonesia_bounds['max_lat'])
-            lng = np.random.uniform(self.indonesia_bounds['min_lng'], 
-                                  self.indonesia_bounds['max_lng'])
-            
-            # Check if point is far enough from presence points
-            too_close = False
-            for _, presence in presence_points.iterrows():
-                distance = np.sqrt((lat - presence['latitude'])**2 + 
-                                 (lng - presence['longitude'])**2)
-                if distance < buffer_distance:
-                    too_close = True
-                    break
-            
-            if not too_close:
-                pseudo_absences.append({'latitude': lat, 'longitude': lng})
-            
-            attempts += 1
-        
-        return pd.DataFrame(pseudo_absences)
-    
-    def match_with_environmental_data(self, points):
-        """Match occurrence points with environmental data"""
-        if self.environmental_data is None:
+    def train_optimized_model(self, species_name, training_data):
+        """Train an optimized Random Forest model"""
+        # Debug: Check if presence column exists
+        if 'presence' not in training_data.columns:
+            print(f"     ❌ Missing 'presence' column. Available columns: {list(training_data.columns)}")
             return None
         
-        # Find nearest environmental data point for each occurrence
-        matched_data = []
-        
-        for _, point in points.iterrows():
-            # Calculate distances to all environmental points
-            distances = np.sqrt(
-                (self.environmental_data['latitude'] - point['latitude'])**2 + 
-                (self.environmental_data['longitude'] - point['longitude'])**2
-            )
-            
-            # Find nearest environmental point
-            nearest_idx = distances.idxmin()
-            
-            if distances[nearest_idx] < 0.3:  # Within ~33km (increased tolerance)
-                env_point = self.environmental_data.iloc[nearest_idx].copy()
-                env_point['presence'] = point['presence']
-                env_point['original_lat'] = point['latitude']
-                env_point['original_lng'] = point['longitude']
-                matched_data.append(env_point)
-        
-        if matched_data:
-            return pd.DataFrame(matched_data)
-        else:
-            return None
-    
-    def train_species_model(self, species_name, training_data):
-        """Train Random Forest model for a species"""
-        print(f"🤖 Training Random Forest model for {species_name}...")
-        
-        # Prepare features and target
+        # Prepare features
         feature_cols = [col for col in self.env_variables if col in training_data.columns]
-        X = training_data[feature_cols].fillna(training_data[feature_cols].mean())
+        if len(feature_cols) == 0:
+            print(f"     ❌ No environmental feature columns found")
+            return None
+            
+        X = training_data[feature_cols]
         y = training_data['presence']
         
-        print(f"  Features: {len(feature_cols)} environmental variables")
-        print(f"  Training samples: {len(X)} ({sum(y)} presences, {len(y)-sum(y)} absences)")
-        
-        # Check if we have enough data
         if len(X) < 20 or sum(y) < 5:
-            print(f"  ⚠️  Insufficient training data")
+            print(f"     ❌ Insufficient data: {len(X)} total points, {sum(y)} presences")
             return None
         
-        # Split data
+        # Use smaller, faster Random Forest
+        rf_model = RandomForestClassifier(
+            n_estimators=50,
+            max_depth=8,
+            min_samples_split=10,
+            min_samples_leaf=5,
+            random_state=42,
+            n_jobs=-1,
+            max_features='sqrt'
+        )
+        
+        # Simple train-test split
         try:
             X_train, X_test, y_train, y_test = train_test_split(
                 X, y, test_size=0.2, random_state=42, stratify=y
             )
         except ValueError:
-            # If stratify fails, try without it
             X_train, X_test, y_train, y_test = train_test_split(
                 X, y, test_size=0.2, random_state=42
             )
         
-        # Train Random Forest
-        rf_model = RandomForestClassifier(
-            n_estimators=100,
-            max_depth=10,
-            min_samples_split=5,
-            min_samples_leaf=2,
-            random_state=42,
-            n_jobs=-1
-        )
-        
+        # Train model
         rf_model.fit(X_train, y_train)
         
-        # Evaluate model
-        train_score = rf_model.score(X_train, y_train)
+        # Quick evaluation
         test_score = rf_model.score(X_test, y_test)
         
-        # Cross-validation
         try:
-            cv_scores = cross_val_score(rf_model, X, y, cv=min(5, len(X)//5), scoring='roc_auc')
-        except:
-            cv_scores = np.array([0.5])  # Default if CV fails
-        
-        # Predictions and metrics
-        y_pred = rf_model.predict(X_test)
-        y_pred_proba = rf_model.predict_proba(X_test)[:, 1]
-        
-        try:
+            y_pred_proba = rf_model.predict_proba(X_test)[:, 1]
             auc_score = roc_auc_score(y_test, y_pred_proba)
         except:
             auc_score = 0.5
@@ -309,249 +461,285 @@ class SpeciesDistributionModeler:
             'model': rf_model,
             'feature_cols': feature_cols,
             'feature_importance': feature_importance,
-            'train_score': train_score,
             'test_score': test_score,
-            'cv_mean': cv_scores.mean(),
-            'cv_std': cv_scores.std(),
             'auc_score': auc_score,
             'n_presences': sum(y),
             'n_absences': len(y) - sum(y),
-            'training_data': training_data
+            'n_training_points': len(training_data)
         }
-        
-        print(f"  ✅ Model trained successfully")
-        print(f"     Train accuracy: {train_score:.3f}")
-        print(f"     Test accuracy: {test_score:.3f}")
-        print(f"     CV AUC: {cv_scores.mean():.3f} ± {cv_scores.std():.3f}")
-        print(f"     Test AUC: {auc_score:.3f}")
         
         return model_info
     
-    def predict_species_distribution(self, species_name, model_info):
-        """Predict species distribution across Indonesia"""
-        print(f"🗺️  Predicting distribution for {species_name}...")
-        
-        if self.environmental_data is None:
-            self.load_environmental_data()
-        
-        # Prepare prediction data
+    def predict_distribution_fast(self, model_info):
+        """Fast prediction across environmental grid"""
         feature_cols = model_info['feature_cols']
-        X_pred = self.environmental_data[feature_cols].fillna(
-            self.environmental_data[feature_cols].mean()
-        )
+        X_pred = self.environmental_data[feature_cols]
         
         # Make predictions
         model = model_info['model']
-        predictions = model.predict_proba(X_pred)[:, 1]  # Probability of presence
+        predictions = model.predict_proba(X_pred)[:, 1]
         
         # Create prediction dataframe
         prediction_df = self.environmental_data[['latitude', 'longitude']].copy()
         prediction_df['suitability'] = predictions
-        prediction_df['species'] = species_name
         
-        print(f"  ✅ Generated {len(prediction_df)} prediction points")
         return prediction_df
-    
-    def create_feature_importance_chart(self, model_info):
-        """Create feature importance visualization"""
-        feature_importance = model_info['feature_importance']
-        
-        # Variable descriptions
-        var_descriptions = {
-            'bio1': 'Annual Mean Temperature',
-            'bio2': 'Mean Diurnal Range',
-            'bio3': 'Isothermality',
-            'bio4': 'Temperature Seasonality',
-            'bio5': 'Max Temperature of Warmest Month',
-            'bio6': 'Min Temperature of Coldest Month',
-            'bio7': 'Temperature Annual Range',
-            'bio8': 'Mean Temperature of Wettest Quarter',
-            'bio9': 'Mean Temperature of Driest Quarter',
-            'bio10': 'Mean Temperature of Warmest Quarter',
-            'bio11': 'Mean Temperature of Coldest Quarter',
-            'bio12': 'Annual Precipitation',
-            'bio13': 'Precipitation of Wettest Month',
-            'bio14': 'Precipitation of Driest Month',
-            'bio15': 'Precipitation Seasonality',
-            'bio16': 'Precipitation of Wettest Quarter',
-            'bio17': 'Precipitation of Driest Quarter',
-            'bio18': 'Precipitation of Warmest Quarter',
-            'bio19': 'Precipitation of Coldest Quarter',
-            'elevation': 'Elevation',
-            'slope': 'Slope',
-            'aspect': 'Aspect',
-            'distance_to_coast': 'Distance to Coast',
-            'population_density': 'Population Density'
-        }
-        
-        # Create HTML for feature importance
-        importance_html = """
-        <div style="padding: 20px; font-family: Arial, sans-serif;">
-            <h3 style="color: #2E8B57; margin-bottom: 20px;">Environmental Variable Importance</h3>
-            <div style="max-height: 400px; overflow-y: auto;">
-        """
-        
-        max_importance = feature_importance['importance'].max()
-        
-        for _, row in feature_importance.iterrows():
-            importance_pct = (row['importance'] / max_importance) * 100
-            var_desc = var_descriptions.get(row['feature'], row['feature'])
-            
-            importance_html += f"""
-                <div style="margin-bottom: 10px;">
-                    <div style="display: flex; justify-content: space-between; margin-bottom: 2px;">
-                        <span style="font-size: 12px; font-weight: bold;">{var_desc}</span>
-                        <span style="font-size: 11px; color: #666;">{row['importance']:.4f}</span>
-                    </div>
-                    <div style="background-color: #f0f0f0; height: 15px; border-radius: 7px;">
-                        <div style="background-color: #2E8B57; height: 15px; width: {importance_pct}%; border-radius: 7px;"></div>
-                    </div>
-                </div>
-            """
-        
-        importance_html += """
-            </div>
-        </div>
-        """
-        
-        return importance_html
-    
-    def save_model(self, species_name, model_info):
-        """Save trained model to disk"""
-        model_file = self.results_dir / f"{species_name.replace(' ', '_')}_model.pkl"
-        
-        with open(model_file, 'wb') as f:
-            pickle.dump(model_info, f)
-        
-        print(f"  💾 Saved model to {model_file}")
-    
-    def create_comprehensive_map(self, species_models_dict):
-        """Create comprehensive map with dropdown species selection"""
-        print("🗺️  Creating comprehensive interactive map...")
+    def create_fast_interactive_map(self, species_models_dict):
+        """Create optimized interactive map with working heatmap"""
+        print("🗺️  Creating interactive map...")
         
         # Create base map
-        center_lat = (self.indonesia_bounds['min_lat'] + self.indonesia_bounds['max_lat']) / 2
-        center_lng = (self.indonesia_bounds['min_lng'] + self.indonesia_bounds['max_lng']) / 2
-        
         m = folium.Map(
-            location=[center_lat, center_lng],
+            location=[-2.5, 118.0],
             zoom_start=5,
             tiles='OpenStreetMap'
         )
         
         # Add tile layers
-        folium.TileLayer('CartoDB positron', name='Light Mode').add_to(m)
-        folium.TileLayer('CartoDB dark_matter', name='Dark Mode').add_to(m)
-        folium.TileLayer('Stamen Terrain', name='Terrain').add_to(m)
+        folium.TileLayer('CartoDB positron', name='Light').add_to(m)
+        folium.TileLayer('CartoDB dark_matter', name='Dark').add_to(m)
         
-        # Create species data for JavaScript
+        # Prepare data for JavaScript
         species_data = {}
         
         for species_name, (model_info, predictions) in species_models_dict.items():
-            # Prepare heatmap data
-            heat_data = []
-            presence_points = []
+            print(f"     Processing {species_name} for visualization...")
             
-            for _, row in predictions.iterrows():
-                if row['suitability'] > 0.1:
-                    heat_data.append([row['latitude'], row['longitude'], row['suitability']])
+            # Debug: Check prediction data
+            print(f"       Suitability range: {predictions['suitability'].min():.3f} - {predictions['suitability'].max():.3f}")
+            
+            # Sample prediction points for visualization
+            sampled_predictions = predictions.iloc[::3]  # Every 3rd point
+            
+            # Create heatmap data with multiple intensity levels
+            heat_data = []
+            high_markers = []
+            medium_markers = []
+            low_markers = []
+            
+            for _, row in sampled_predictions.iterrows():
+                lat, lng, suit = float(row['latitude']), float(row['longitude']), float(row['suitability'])
+                
+                # Categorize by suitability
+                if suit > 0.7:
+                    heat_data.append([lat, lng, suit])
+                    high_markers.append([lat, lng, suit])
+                elif suit > 0.4:
+                    heat_data.append([lat, lng, suit])
+                    medium_markers.append([lat, lng, suit])
+                elif suit > 0.1:
+                    heat_data.append([lat, lng, suit])
+                    low_markers.append([lat, lng, suit])
+            
+            print(f"       Heat points: {len(heat_data)}, High: {len(high_markers)}, Medium: {len(medium_markers)}, Low: {len(low_markers)}")
             
             # Get presence points
-            training_data = model_info['training_data']
-            presence_data = training_data[training_data['presence'] == 1]
+            presence_points = []
+            if 'training_data' in model_info:
+                try:
+                    presence_data = model_info['training_data'][
+                        model_info['training_data']['presence'] == 1
+                    ]
+                    
+                    if len(presence_data) > 50:
+                        presence_data = presence_data.sample(n=50, random_state=42)
+                    
+                    for _, point in presence_data.iterrows():
+                        lat_val = point.get('latitude', point.get('original_latitude', None))
+                        lng_val = point.get('longitude', point.get('original_longitude', None))
+                        
+                        if lat_val is not None and lng_val is not None:
+                            try:
+                                presence_points.append([float(lat_val), float(lng_val)])
+                            except (ValueError, TypeError):
+                                continue
+                    
+                except Exception as e:
+                    print(f"       Warning: Could not process presence points: {e}")
+                    presence_points = []
             
-            for _, point in presence_data.iterrows():
-                presence_points.append([point['original_lat'], point['original_lng']])
-            
-            # Feature importance for popup
-            feature_importance = model_info['feature_importance'].head(10)
+            # Feature importance
+            top_features = model_info['feature_importance'].head(8)
             importance_text = "<br>".join([
-                f"{row['feature']}: {row['importance']:.4f}"
-                for _, row in feature_importance.iterrows()
+                f"{row['feature']}: {row['importance']:.3f}"
+                for _, row in top_features.iterrows()
             ])
             
             species_data[species_name] = {
-                'heat_data': heat_data,
+                'heat_data': heat_data[:800],
+                'high_markers': high_markers[:50],
+                'medium_markers': medium_markers[:100],
+                'low_markers': low_markers[:150],
                 'presence_points': presence_points,
                 'model_performance': {
-                    'cv_auc': f"{model_info['cv_mean']:.3f} ± {model_info['cv_std']:.3f}",
-                    'test_auc': f"{model_info['auc_score']:.3f}",
                     'test_accuracy': f"{model_info['test_score']:.3f}",
-                    'n_presences': model_info['n_presences'],
-                    'n_absences': model_info['n_absences']
+                    'auc_score': f"{model_info['auc_score']:.3f}",
+                    'n_presences': int(model_info['n_presences']),
+                    'n_training_points': int(model_info['n_training_points'])
                 },
                 'top_features': importance_text
             }
         
-        # Create JavaScript for interactive functionality
+        # Create JavaScript with proper heatmap plugin loading
         species_list = list(species_models_dict.keys())
         
         js_code = f"""
-        var speciesData = {json.dumps(species_data)};
-        var speciesList = {json.dumps(species_list)};
-        var currentHeatmap = null;
-        var currentPresenceLayer = null;
+        var speciesData = {json.dumps(species_data, ensure_ascii=False)};
+        var speciesList = {json.dumps(species_list, ensure_ascii=False)};
+        var currentLayers = [];
         var map = window['{m.get_name()}'];
         
+        // Load heatmap plugin if not available
+        function loadHeatmapPlugin() {{
+            if (typeof L.heatLayer === 'undefined') {{
+                var script = document.createElement('script');
+                script.src = 'https://cdn.jsdelivr.net/npm/leaflet.heat@0.2.0/dist/leaflet-heat.js';
+                script.onload = function() {{
+                    console.log('Heatmap plugin loaded successfully');
+                }};
+                script.onerror = function() {{
+                    console.log('Failed to load heatmap plugin, using markers instead');
+                }};
+                document.head.appendChild(script);
+            }}
+        }}
+        
+        function clearLayers() {{
+            currentLayers.forEach(function(layer) {{
+                map.removeLayer(layer);
+            }});
+            currentLayers = [];
+        }}
+        
         function updateSpeciesDisplay(speciesName) {{
-            // Remove existing layers
-            if (currentHeatmap) {{
-                map.removeLayer(currentHeatmap);
-            }}
-            if (currentPresenceLayer) {{
-                map.removeLayer(currentPresenceLayer);
-            }}
+            console.log('Updating display for:', speciesName);
+            clearLayers();
             
             if (speciesName && speciesData[speciesName]) {{
                 var data = speciesData[speciesName];
+                console.log('Data found:', data);
                 
-                // Add heatmap
-                if (data.heat_data.length > 0) {{
-                    currentHeatmap = L.heatLayer(data.heat_data, {{
-                        radius: 8,
-                        blur: 10,
-                        minOpacity: 0.2,
-                        gradient: {{0.4: 'blue', 0.6: 'cyan', 0.7: 'lime', 0.8: 'yellow', 1.0: 'red'}}
-                    }}).addTo(map);
+                // Try heatmap first, fallback to markers
+                if (typeof L.heatLayer !== 'undefined' && data.heat_data && data.heat_data.length > 0) {{
+                    try {{
+                        var heatmap = L.heatLayer(data.heat_data, {{
+                            radius: 20,
+                            blur: 25,
+                            minOpacity: 0.4,
+                            gradient: {{0.2: 'blue', 0.4: 'cyan', 0.6: 'lime', 0.8: 'yellow', 1.0: 'red'}}
+                        }}).addTo(map);
+                        currentLayers.push(heatmap);
+                        console.log('Heatmap added successfully');
+                    }} catch (e) {{
+                        console.log('Heatmap failed:', e.message);
+                        addMarkerLayers(data);
+                    }}
+                }} else {{
+                    console.log('Using marker fallback');
+                    addMarkerLayers(data);
                 }}
                 
                 // Add presence points
-                currentPresenceLayer = L.layerGroup();
-                data.presence_points.forEach(function(point) {{
+                if (data.presence_points && data.presence_points.length > 0) {{
+                    var presenceLayer = L.layerGroup();
+                    data.presence_points.forEach(function(point) {{
+                        L.circleMarker([point[0], point[1]], {{
+                            radius: 5,
+                            color: 'darkgreen',
+                            weight: 2,
+                            fillColor: 'lightgreen',
+                            fillOpacity: 0.9
+                        }}).bindTooltip('Observed: ' + speciesName)
+                          .addTo(presenceLayer);
+                    }});
+                    presenceLayer.addTo(map);
+                    currentLayers.push(presenceLayer);
+                    console.log('Added', data.presence_points.length, 'presence points');
+                }}
+                
+                updateInfoPanel(speciesName, data);
+            }}
+        }}
+        
+        function addMarkerLayers(data) {{
+            // High suitability markers (red)
+            if (data.high_markers && data.high_markers.length > 0) {{
+                var highLayer = L.layerGroup();
+                data.high_markers.forEach(function(point) {{
+                    L.circleMarker([point[0], point[1]], {{
+                        radius: 8,
+                        color: 'darkred',
+                        weight: 1,
+                        fillColor: 'red',
+                        fillOpacity: 0.8
+                    }}).bindTooltip('High suitability: ' + point[2].toFixed(3))
+                      .addTo(highLayer);
+                }});
+                highLayer.addTo(map);
+                currentLayers.push(highLayer);
+                console.log('Added', data.high_markers.length, 'high suitability markers');
+            }}
+            
+            // Medium suitability markers (orange)
+            if (data.medium_markers && data.medium_markers.length > 0) {{
+                var mediumLayer = L.layerGroup();
+                data.medium_markers.forEach(function(point) {{
+                    L.circleMarker([point[0], point[1]], {{
+                        radius: 6,
+                        color: 'darkorange',
+                        weight: 1,
+                        fillColor: 'orange',
+                        fillOpacity: 0.7
+                    }}).bindTooltip('Medium suitability: ' + point[2].toFixed(3))
+                      .addTo(mediumLayer);
+                }});
+                mediumLayer.addTo(map);
+                currentLayers.push(mediumLayer);
+                console.log('Added', data.medium_markers.length, 'medium suitability markers');
+            }}
+            
+            // Low suitability markers (yellow)
+            if (data.low_markers && data.low_markers.length > 0) {{
+                var lowLayer = L.layerGroup();
+                data.low_markers.forEach(function(point) {{
                     L.circleMarker([point[0], point[1]], {{
                         radius: 4,
-                        color: 'green',
-                        weight: 2,
-                        fillColor: 'lightgreen',
-                        fillOpacity: 0.8
-                    }}).bindPopup('Observed ' + speciesName).addTo(currentPresenceLayer);
+                        color: 'goldenrod',
+                        weight: 1,
+                        fillColor: 'yellow',
+                        fillOpacity: 0.6
+                    }}).bindTooltip('Low suitability: ' + point[2].toFixed(3))
+                      .addTo(lowLayer);
                 }});
-                currentPresenceLayer.addTo(map);
-                
-                // Update info panel
-                updateInfoPanel(speciesName, data);
+                lowLayer.addTo(map);
+                currentLayers.push(lowLayer);
+                console.log('Added', data.low_markers.length, 'low suitability markers');
             }}
         }}
         
         function updateInfoPanel(speciesName, data) {{
             var infoDiv = document.getElementById('speciesInfo');
             if (infoDiv) {{
+                var truncatedName = speciesName.length > 35 ? speciesName.substring(0, 35) + '...' : speciesName;
                 infoDiv.innerHTML = `
-                    <h4 style="margin: 0 0 10px 0; color: #2E8B57;">${{speciesName}}</h4>
-                    <div style="margin-bottom: 8px;">
+                    <h4 style="margin: 0 0 10px 0; color: #2E8B57; font-size: 13px;">${{truncatedName}}</h4>
+                    <div style="margin-bottom: 8px; font-size: 11px;">
                         <b>Model Performance:</b><br>
-                        CV AUC: ${{data.model_performance.cv_auc}}<br>
-                        Test AUC: ${{data.model_performance.test_auc}}<br>
-                        Test Accuracy: ${{data.model_performance.test_accuracy}}
+                        Accuracy: ${{data.model_performance.test_accuracy}}<br>
+                        AUC Score: ${{data.model_performance.auc_score}}<br>
+                        Training Points: ${{data.model_performance.n_training_points}}<br>
+                        Presences: ${{data.model_performance.n_presences}}
                     </div>
-                    <div style="margin-bottom: 8px;">
-                        <b>Training Data:</b><br>
-                        Presences: ${{data.model_performance.n_presences}}<br>
-                        Absences: ${{data.model_performance.n_absences}}
+                    <div style="margin-bottom: 8px; font-size: 10px; color: #666;">
+                        <b>Habitat Suitability:</b><br>
+                        High (>0.7): ${{data.high_markers.length}} points<br>
+                        Medium (0.4-0.7): ${{data.medium_markers.length}} points<br>
+                        Low (0.1-0.4): ${{data.low_markers.length}} points<br>
+                        Observations: ${{data.presence_points.length}} points
                     </div>
-                    <details style="margin-top: 10px;">
-                        <summary style="cursor: pointer; font-weight: bold;">Top Environmental Factors</summary>
-                        <div style="font-size: 10px; margin-top: 5px; max-height: 150px; overflow-y: auto;">
+                    <details style="margin-top: 8px;">
+                        <summary style="cursor: pointer; font-weight: bold; font-size: 11px;">Environmental Factors</summary>
+                        <div style="font-size: 9px; margin-top: 5px; max-height: 120px; overflow-y: auto;">
                             ${{data.top_features}}
                         </div>
                     </details>
@@ -559,18 +747,20 @@ class SpeciesDistributionModeler:
             }}
         }}
         
-        // Initialize dropdown
+        // Initialize everything
         setTimeout(function() {{
+            loadHeatmapPlugin();
+            
             var controlDiv = document.createElement('div');
             controlDiv.style.cssText = `
                 position: fixed; top: 10px; left: 50px; z-index: 9999;
-                background-color: white; padding: 10px; border-radius: 5px;
-                box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+                background-color: white; padding: 8px; border-radius: 5px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.2);
             `;
             
             var select = document.createElement('select');
-            select.style.cssText = 'width: 250px; font-size: 12px; padding: 5px;';
-            select.innerHTML = '<option value="">Select a species...</option>';
+            select.style.cssText = 'width: 280px; font-size: 11px; padding: 4px;';
+            select.innerHTML = '<option value="">🔍 Select a species to view distribution...</option>';
             
             speciesList.forEach(function(species) {{
                 var option = document.createElement('option');
@@ -586,171 +776,270 @@ class SpeciesDistributionModeler:
             controlDiv.appendChild(select);
             document.body.appendChild(controlDiv);
             
-            // Create info panel
             var infoDiv = document.createElement('div');
             infoDiv.id = 'speciesInfo';
             infoDiv.style.cssText = `
-                position: fixed; top: 10px; right: 10px; width: 320px;
-                background-color: white; border: 2px solid grey; z-index: 9999;
-                font-size: 12px; padding: 15px; border-radius: 5px;
-                box-shadow: 0 4px 8px rgba(0,0,0,0.2); max-height: 400px;
+                position: fixed; top: 10px; right: 10px; width: 260px;
+                background-color: white; border: 1px solid #ccc; z-index: 9999;
+                font-size: 11px; padding: 10px; border-radius: 5px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.2); max-height: 400px;
                 overflow-y: auto;
             `;
-            infoDiv.innerHTML = '<p style="color: #666;">Select a species from the dropdown to view its distribution model.</p>';
+            infoDiv.innerHTML = `
+                <p style="color: #666; font-size: 10px; margin: 0;">
+                    Select a species to view its predicted distribution.
+                    <br><br>
+                    🔴 Red = High habitat suitability (>0.7)<br>
+                    🟠 Orange = Medium suitability (0.4-0.7)<br>
+                    🟡 Yellow = Low suitability (0.1-0.4)<br>
+                    🟢 Green = Observed occurrences<br><br>
+                    Click markers for suitability values
+                </p>
+            `;
             document.body.appendChild(infoDiv);
+            
+            console.log('Map interface initialized');
         }}, 1000);
         """
         
         # Add JavaScript to map
         m.get_root().html.add_child(folium.Element(f"<script>{js_code}</script>"))
         
+        # Add legend
+        legend_html = '''
+        <div style="position: fixed; bottom: 20px; left: 20px; width: 220px; height: 160px;
+                    background-color: white; border: 1px solid grey; z-index: 9999;
+                    font-size: 10px; padding: 10px; border-radius: 5px;
+                    box-shadow: 0 2px 4px rgba(0,0,0,0.2);">
+            <h4 style="margin: 0 0 8px 0; color: #2E8B57; font-size: 12px;">Habitat Suitability</h4>
+            
+            <div style="margin-bottom: 5px;">
+                <span style="display: inline-block; width: 12px; height: 12px; 
+                           background-color: red; border-radius: 50%; margin-right: 5px;"></span>
+                High (>0.7) - Optimal habitat
+            </div>
+            
+            <div style="margin-bottom: 5px;">
+                <span style="display: inline-block; width: 12px; height: 12px; 
+                           background-color: orange; border-radius: 50%; margin-right: 5px;"></span>
+                Medium (0.4-0.7) - Suitable habitat
+            </div>
+            
+            <div style="margin-bottom: 5px;">
+                <span style="display: inline-block; width: 12px; height: 12px; 
+                           background-color: yellow; border-radius: 50%; margin-right: 5px;"></span>
+                Low (0.1-0.4) - Marginal habitat
+            </div>
+            
+            <div style="margin-bottom: 8px;">
+                <span style="display: inline-block; width: 12px; height: 12px; 
+                           background-color: lightgreen; border: 1px solid darkgreen; border-radius: 50%; margin-right: 5px;"></span>
+                Observed occurrences
+            </div>
+            
+            <div style="font-size: 9px; color: #666; border-top: 1px solid #ccc; padding-top: 5px;">
+                • Random Forest predictions<br>
+                • Click markers for details<br>
+                • Use layer control (top-right)
+            </div>
+        </div>
+        '''
+        m.get_root().html.add_child(folium.Element(legend_html))
+        
         # Add layer control
         folium.LayerControl().add_to(m)
         
-        # Add fullscreen button
-        plugins.Fullscreen().add_to(m)
-        
         return m
-    
-    def run_modeling_workflow(self, max_species=10, min_occurrences=20):
-        """Run complete species distribution modeling workflow"""
-        print("🚀 Starting Species Distribution Modeling Workflow")
+
+    def run_fixed_modeling_workflow(self, max_species=10, min_occurrences=20):
+        """Run fixed species distribution modeling workflow"""
+        start_time = time.time()
+        
+        print("🔧 FIXED Species Distribution Modeling Workflow")
+        print("="*60)
+        print("🚀 Fixes binary blob data corruption in environmental database")
+        print(f"🎯 Target: {max_species} species with ≥{min_occurrences} occurrences")
+        
+        # Step 1: Load and prepare environmental data (with fix)
+        if not self.load_and_prepare_environmental_data():
+            print("❌ Failed to load environmental data")
+            return None
+        
+        # Step 2: Get species list
+        species_df = self.get_species_list_optimized(min_occurrences, max_species)
+        if len(species_df) == 0:
+            print("❌ No suitable species found")
+            return None
+        
+        species_list = species_df['species'].tolist()
+        print(f"\n🎯 Selected species for modeling:")
+        for i, (_, row) in enumerate(species_df.iterrows(), 1):
+            print(f"  {i:2d}. {row['species']:<45} ({row['occurrence_count']:,} records)")
+        
+        # Step 3: Load all occurrence data at once
+        all_occurrences = self.load_all_occurrence_data(species_list)
+        
+        # Step 4: Process each species
+        print(f"\n{'='*60}")
+        print("TRAINING MODELS")
         print("="*60)
         
-        # Load environmental data
-        env_data = self.load_environmental_data()
-        if env_data is None or len(env_data) == 0:
-            print("❌ No environmental data available. Please run environmental data download first.")
-            return None
-        
-        # Get species list
-        species_list = self.get_species_list(min_occurrences)
-        
-        if not species_list:
-            print("❌ No species found with sufficient occurrences")
-            return None
-        
-        # Limit to max_species for demonstration
-        species_to_model = species_list[:max_species]
-        print(f"\n🎯 Modeling {len(species_to_model)} species:")
-        for i, species in enumerate(species_to_model, 1):
-            print(f"  {i:2d}. {species}")
-        
-        # Model each species
         species_models_dict = {}
         
-        for i, species_name in enumerate(species_to_model, 1):
-            print(f"\n{'='*60}")
-            print(f"MODELING SPECIES {i}/{len(species_to_model)}: {species_name}")
-            print("="*60)
+        for i, species_name in enumerate(species_list, 1):
+            species_start = time.time()
+            print(f"\n[{i:2d}/{len(species_list)}] Processing: {species_name}")
             
             try:
                 # Prepare training data
-                training_data = self.prepare_species_data(species_name)
+                training_data = self.prepare_training_data_batch(all_occurrences, species_name)
                 if training_data is None:
-                    print(f"❌ Skipping {species_name} - insufficient data")
+                    print(f"     ❌ Insufficient data")
                     continue
                 
                 # Train model
-                model_info = self.train_species_model(species_name, training_data)
+                model_info = self.train_optimized_model(species_name, training_data)
                 if model_info is None:
-                    print(f"❌ Failed to train model for {species_name}")
+                    print(f"     ❌ Model training failed")
                     continue
                 
-                # Make predictions
-                predictions = self.predict_species_distribution(species_name, model_info)
+                # Store training data in model_info for visualization
+                model_info['training_data'] = training_data
                 
-                # Save individual model
-                self.save_model(species_name, model_info)
+                # Predict distribution
+                predictions = self.predict_distribution_fast(model_info)
                 
-                # Store for comprehensive map
+                # Store results
                 species_models_dict[species_name] = (model_info, predictions)
                 
-                print(f"✅ Successfully modeled {species_name}")
+                species_time = time.time() - species_start
+                print(f"     ✅ Success! AUC: {model_info['auc_score']:.3f} | "
+                      f"Accuracy: {model_info['test_score']:.3f} | "
+                      f"Time: {species_time:.1f}s")
                 
             except Exception as e:
-                print(f"❌ Error modeling {species_name}: {e}")
+                print(f"     ❌ Error: {str(e)[:50]}...")
                 continue
         
         if not species_models_dict:
             print("❌ No models were successfully trained")
             return None
         
+        # Step 5: Create visualization
         print(f"\n{'='*60}")
-        print(f"CREATING COMPREHENSIVE VISUALIZATION")
+        print("CREATING INTERACTIVE MAP")
         print("="*60)
         
-        # Create comprehensive interactive map
-        comprehensive_map = self.create_comprehensive_map(species_models_dict)
+        interactive_map = self.create_fast_interactive_map(species_models_dict)
         
-        # Save map
-        map_filename = self.results_dir / "species_distribution_models.html"
-        comprehensive_map.save(str(map_filename))
+        # Save results
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        map_filename = self.results_dir / f"fixed_species_distribution_models_{timestamp}.html"
+        interactive_map.save(str(map_filename))
         
-        print(f"\n🎉 MODELING WORKFLOW COMPLETE!")
-        print("="*60)
-        print(f"Successfully modeled: {len(species_models_dict)} species")
-        print(f"Interactive map saved: {map_filename}")
-        print(f"Individual models saved in: {self.results_dir}")
-        
-        # Print summary statistics
-        print(f"\nModel Performance Summary:")
+        # Save models summary
+        summary_data = []
         for species_name, (model_info, _) in species_models_dict.items():
-            print(f"  {species_name:<40} AUC: {model_info['auc_score']:.3f}")
+            summary_data.append({
+                'species': species_name,
+                'test_accuracy': model_info['test_score'],
+                'auc_score': model_info['auc_score'],
+                'n_presences': model_info['n_presences'],
+                'n_training_points': model_info['n_training_points'],
+                'top_environmental_factor': model_info['feature_importance'].iloc[0]['feature']
+            })
+        
+        summary_df = pd.DataFrame(summary_data)
+        summary_filename = self.results_dir / f"modeling_summary_{timestamp}.csv"
+        summary_df.to_csv(summary_filename, index=False)
+        
+        # Final summary
+        total_time = time.time() - start_time
+        avg_time_per_species = total_time / len(species_models_dict)
+        
+        print(f"\n🎉 FIXED MODELING COMPLETE!")
+        print("="*60)
+        print(f"✅ Successfully modeled: {len(species_models_dict)}/{len(species_list)} species")
+        print(f"⏱️  Total time: {total_time:.1f} seconds ({avg_time_per_species:.1f}s per species)")
+        print(f"🗺️  Interactive map: {map_filename}")
+        print(f"📊 Summary CSV: {summary_filename}")
+        
+        print(f"\n📈 Model Performance Overview:")
+        avg_auc = summary_df['auc_score'].mean()
+        avg_accuracy = summary_df['test_accuracy'].mean()
+        print(f"   Average AUC: {avg_auc:.3f}")
+        print(f"   Average Accuracy: {avg_accuracy:.3f}")
+        print(f"   Best performing species: {summary_df.loc[summary_df['auc_score'].idxmax(), 'species']}")
+        
+        print(f"\n🔍 Usage Instructions:")
+        print(f"   1. Open {map_filename} in your browser")
+        print(f"   2. Select species from dropdown menu")
+        print(f"   3. View habitat suitability (red=high, blue=low)")
+        print(f"   4. Green dots show actual observations")
+        print(f"   5. Right panel shows model performance")
         
         return species_models_dict, str(map_filename)
 
 def main():
-    """Main function to run species distribution modeling"""
-    print("🌍 Indonesian Species Distribution Modeling")
-    print("Using Random Forest with Environmental Predictors")
+    """Main function for fixed species distribution modeling"""
+    print("🔧 FIXED Indonesian Species Distribution Modeling")
+    print("🚀 Handles Binary Blob Data Corruption")
     print("="*60)
     
     # Initialize modeler
-    modeler = SpeciesDistributionModeler()
+    modeler = FixedSpeciesDistributionModeler()
     
     # Configuration
-    max_species = 15  # Number of species to model
-    min_occurrences = 25  # Minimum occurrences required
+    max_species = 12
+    min_occurrences = 25
     
-    print(f"Configuration:")
-    print(f"  - Maximum species to model: {max_species}")
-    print(f"  - Minimum occurrences per species: {min_occurrences}")
-    print(f"  - Model type: Random Forest")
-    print(f"  - Pseudo-absence strategy: Random sampling with buffer")
+    print(f"⚙️  Configuration:")
+    print(f"   • Max species: {max_species}")
+    print(f"   • Min occurrences: {min_occurrences}")
+    print(f"   • Model: Random Forest (optimized)")
+    print(f"   • Fix: Binary blob data conversion")
     
-    # Run modeling workflow
-    result = modeler.run_modeling_workflow(
-        max_species=max_species,
-        min_occurrences=min_occurrences
-    )
+    # Check if required data exists
+    if not Path("biodiversity_data/indonesia_biodiversity.db").exists():
+        print("❌ Database not found! Please run download_records.py first.")
+        return
     
-    if result:
-        models_dict, map_file = result
-        print(f"\n✅ Successfully created species distribution models!")
-        print(f"📊 Models trained: {len(models_dict)}")
-        print(f"🗺️  Interactive map: {map_file}")
-        print(f"\n🔍 Open {map_file} in your browser to explore the results!")
-        print(f"\n📋 Usage Instructions:")
-        print(f"  1. Open {map_file} in your web browser")
-        print(f"  2. Use the dropdown menu to select different species")
-        print(f"  3. View habitat suitability heatmap (blue=low, red=high)")
-        print(f"  4. Green circles show actual observation points")
-        print(f"  5. Right panel shows model performance and feature importance")
-        print(f"  6. Toggle between different map layers using the layer control")
+    print(f"\n🚀 Starting fixed modeling workflow...")
+    
+    try:
+        result = modeler.run_fixed_modeling_workflow(
+            max_species=max_species,
+            min_occurrences=min_occurrences
+        )
         
-        print(f"\n🔬 Model Insights:")
-        avg_auc = np.mean([info[0]['auc_score'] for info in models_dict.values()])
-        print(f"  - Average model AUC: {avg_auc:.3f}")
-        print(f"  - Environmental variables used: {len(modeler.env_variables)}")
-        print(f"  - Resolution: ~28km environmental grid")
-        
-    else:
-        print("❌ Species distribution modeling failed")
-        print("💡 Make sure you have:")
-        print("  1. Run the environmental data processor first")
-        print("  2. Have sufficient species occurrence data in your database")
-        print("  3. Installed required packages: scikit-learn, folium")
+        if result:
+            models_dict, map_file = result
+            print(f"\n✅ SUCCESS! Created {len(models_dict)} species distribution models")
+            print(f"\n📁 Files created:")
+            print(f"   🗺️  Interactive map: {map_file}")
+            print(f"   📊 Results summary: sdm_results/modeling_summary_*.csv")
+            print(f"\n🔬 Research Applications:")
+            print(f"   • Conservation priority mapping")
+            print(f"   • Climate change impact assessment")
+            print(f"   • Habitat suitability analysis")
+            print(f"   • Species range predictions")
+            print(f"\n🎯 Next Steps:")
+            print(f"   1. Open the HTML file in your browser")
+            print(f"   2. Explore species distributions using dropdown")
+            print(f"   3. Analyze environmental drivers")
+            print(f"   4. Export data for publications")
+            
+        else:
+            print("❌ Modeling workflow failed")
+            print("💡 Troubleshooting:")
+            print("   • Check that environmental data exists")
+            print("   • Verify species occurrence data")
+            print("   • Ensure required packages are installed")
+            
+    except Exception as e:
+        print(f"❌ Error during modeling: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
